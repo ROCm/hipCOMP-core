@@ -1,0 +1,420 @@
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// MIT License
+//
+// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#ifndef SNAPPY_DECOMPRESSION_DECODER_WARP_SCANS_HIPH
+#define SNAPPY_DECOMPRESSION_DECODER_WARP_SCANS_HIPH
+
+namespace hipcomp
+{
+
+namespace snappy
+{
+  /**
+   * @brief Lookup table for get_len3_mask()
+   *
+   * Indexed by a 10-bit pattern, contains the corresponding 4-bit mask of
+   * 3-byte code lengths in the lower 4 bits, along with the total number of
+   * bytes used for coding the four lengths in the upper 4 bits.
+   * The upper 4-bit value could also be obtained by 8+__popc(mask4)
+   *
+   *   for (uint32_t k = 0; k < 1024; k++)
+   *   {
+   *     for (uint32_t i = 0, v = 0, b = k, n = 0; i < 4; i++)
+   *     {
+   *       v |= (b & 1) << i;
+   *       n += (b & 1) + 2;
+   *       b >>= (b & 1) + 2;
+   *     }
+   *     k_len3lut[k] = v | (n << 4);
+   *   }
+   *
+   **/
+  static const uint8_t __device__ __constant__ k_len3lut[1 << 10] = {
+    0x80, 0x91, 0x80, 0x91, 0x92, 0x91, 0x92, 0x91, 0x80, 0xa3, 0x80, 0xa3, 0x92, 0xa3, 0x92, 0xa3,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xa3, 0x94, 0xa3, 0x92, 0xa3, 0x92, 0xa3,
+    0x80, 0xa5, 0x80, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x80, 0xa3, 0x80, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0x94, 0xa5, 0x94, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x94, 0xa3, 0x94, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0x98, 0x91, 0x98, 0x91, 0x92, 0x91, 0x92, 0x91, 0x98, 0xb7, 0x98, 0xb7, 0x92, 0xb7, 0x92, 0xb7,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xb7, 0x94, 0xb7, 0x92, 0xb7, 0x92, 0xb7,
+    0x98, 0xa5, 0x98, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x98, 0xb7, 0x98, 0xb7, 0xa6, 0xb7, 0xa6, 0xb7,
+    0x94, 0xa5, 0x94, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x94, 0xb7, 0x94, 0xb7, 0xa6, 0xb7, 0xa6, 0xb7,
+    0x80, 0xa9, 0x80, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x80, 0xa3, 0x80, 0xa3, 0xaa, 0xa3, 0xaa, 0xa3,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xa3, 0xac, 0xa3, 0xaa, 0xa3, 0xaa, 0xa3,
+    0x80, 0xa5, 0x80, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x80, 0xa3, 0x80, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0xac, 0xa5, 0xac, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0xac, 0xa3, 0xac, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0x98, 0xa9, 0x98, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x98, 0xb7, 0x98, 0xb7, 0xaa, 0xb7, 0xaa, 0xb7,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xb7, 0xac, 0xb7, 0xaa, 0xb7, 0xaa, 0xb7,
+    0x98, 0xa5, 0x98, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x98, 0xb7, 0x98, 0xb7, 0xa6, 0xb7, 0xa6, 0xb7,
+    0xac, 0xa5, 0xac, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0xac, 0xb7, 0xac, 0xb7, 0xa6, 0xb7, 0xa6, 0xb7,
+    0x80, 0x91, 0x80, 0x91, 0x92, 0x91, 0x92, 0x91, 0x80, 0xbb, 0x80, 0xbb, 0x92, 0xbb, 0x92, 0xbb,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xbb, 0x94, 0xbb, 0x92, 0xbb, 0x92, 0xbb,
+    0x80, 0xbd, 0x80, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x80, 0xbb, 0x80, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0x94, 0xbd, 0x94, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x94, 0xbb, 0x94, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0x98, 0x91, 0x98, 0x91, 0x92, 0x91, 0x92, 0x91, 0x98, 0xb7, 0x98, 0xb7, 0x92, 0xb7, 0x92, 0xb7,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xb7, 0x94, 0xb7, 0x92, 0xb7, 0x92, 0xb7,
+    0x98, 0xbd, 0x98, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x98, 0xb7, 0x98, 0xb7, 0xbe, 0xb7, 0xbe, 0xb7,
+    0x94, 0xbd, 0x94, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x94, 0xb7, 0x94, 0xb7, 0xbe, 0xb7, 0xbe, 0xb7,
+    0x80, 0xa9, 0x80, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x80, 0xbb, 0x80, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xbb, 0xac, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb,
+    0x80, 0xbd, 0x80, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x80, 0xbb, 0x80, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0xac, 0xbd, 0xac, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0xac, 0xbb, 0xac, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0x98, 0xa9, 0x98, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x98, 0xb7, 0x98, 0xb7, 0xaa, 0xb7, 0xaa, 0xb7,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xb7, 0xac, 0xb7, 0xaa, 0xb7, 0xaa, 0xb7,
+    0x98, 0xbd, 0x98, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x98, 0xb7, 0x98, 0xb7, 0xbe, 0xb7, 0xbe, 0xb7,
+    0xac, 0xbd, 0xac, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0xac, 0xb7, 0xac, 0xb7, 0xbe, 0xb7, 0xbe, 0xb7,
+    0x80, 0x91, 0x80, 0x91, 0x92, 0x91, 0x92, 0x91, 0x80, 0xa3, 0x80, 0xa3, 0x92, 0xa3, 0x92, 0xa3,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xa3, 0x94, 0xa3, 0x92, 0xa3, 0x92, 0xa3,
+    0x80, 0xa5, 0x80, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x80, 0xa3, 0x80, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0x94, 0xa5, 0x94, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x94, 0xa3, 0x94, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0x98, 0x91, 0x98, 0x91, 0x92, 0x91, 0x92, 0x91, 0x98, 0xcf, 0x98, 0xcf, 0x92, 0xcf, 0x92, 0xcf,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xcf, 0x94, 0xcf, 0x92, 0xcf, 0x92, 0xcf,
+    0x98, 0xa5, 0x98, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x98, 0xcf, 0x98, 0xcf, 0xa6, 0xcf, 0xa6, 0xcf,
+    0x94, 0xa5, 0x94, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x94, 0xcf, 0x94, 0xcf, 0xa6, 0xcf, 0xa6, 0xcf,
+    0x80, 0xa9, 0x80, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x80, 0xa3, 0x80, 0xa3, 0xaa, 0xa3, 0xaa, 0xa3,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xa3, 0xac, 0xa3, 0xaa, 0xa3, 0xaa, 0xa3,
+    0x80, 0xa5, 0x80, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x80, 0xa3, 0x80, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0xac, 0xa5, 0xac, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0xac, 0xa3, 0xac, 0xa3, 0xa6, 0xa3, 0xa6, 0xa3,
+    0x98, 0xa9, 0x98, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x98, 0xcf, 0x98, 0xcf, 0xaa, 0xcf, 0xaa, 0xcf,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xcf, 0xac, 0xcf, 0xaa, 0xcf, 0xaa, 0xcf,
+    0x98, 0xa5, 0x98, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0x98, 0xcf, 0x98, 0xcf, 0xa6, 0xcf, 0xa6, 0xcf,
+    0xac, 0xa5, 0xac, 0xa5, 0xa6, 0xa5, 0xa6, 0xa5, 0xac, 0xcf, 0xac, 0xcf, 0xa6, 0xcf, 0xa6, 0xcf,
+    0x80, 0x91, 0x80, 0x91, 0x92, 0x91, 0x92, 0x91, 0x80, 0xbb, 0x80, 0xbb, 0x92, 0xbb, 0x92, 0xbb,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xbb, 0x94, 0xbb, 0x92, 0xbb, 0x92, 0xbb,
+    0x80, 0xbd, 0x80, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x80, 0xbb, 0x80, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0x94, 0xbd, 0x94, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x94, 0xbb, 0x94, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0x98, 0x91, 0x98, 0x91, 0x92, 0x91, 0x92, 0x91, 0x98, 0xcf, 0x98, 0xcf, 0x92, 0xcf, 0x92, 0xcf,
+    0x94, 0x91, 0x94, 0x91, 0x92, 0x91, 0x92, 0x91, 0x94, 0xcf, 0x94, 0xcf, 0x92, 0xcf, 0x92, 0xcf,
+    0x98, 0xbd, 0x98, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x98, 0xcf, 0x98, 0xcf, 0xbe, 0xcf, 0xbe, 0xcf,
+    0x94, 0xbd, 0x94, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x94, 0xcf, 0x94, 0xcf, 0xbe, 0xcf, 0xbe, 0xcf,
+    0x80, 0xa9, 0x80, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x80, 0xbb, 0x80, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xbb, 0xac, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb,
+    0x80, 0xbd, 0x80, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x80, 0xbb, 0x80, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0xac, 0xbd, 0xac, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0xac, 0xbb, 0xac, 0xbb, 0xbe, 0xbb, 0xbe, 0xbb,
+    0x98, 0xa9, 0x98, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0x98, 0xcf, 0x98, 0xcf, 0xaa, 0xcf, 0xaa, 0xcf,
+    0xac, 0xa9, 0xac, 0xa9, 0xaa, 0xa9, 0xaa, 0xa9, 0xac, 0xcf, 0xac, 0xcf, 0xaa, 0xcf, 0xaa, 0xcf,
+    0x98, 0xbd, 0x98, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0x98, 0xcf, 0x98, 0xcf, 0xbe, 0xcf, 0xbe, 0xcf,
+    0xac, 0xbd, 0xac, 0xbd, 0xbe, 0xbd, 0xbe, 0xbd, 0xac, 0xcf, 0xac, 0xcf, 0xbe, 0xcf, 0xbe, 0xcf};
+
+  /**
+   * @brief Returns a 32-bit mask where 1 means 3-byte code length and 0 means 2-byte
+   * code length, given an input mask of up to 96 bits.
+   *
+   * Implemented by doing 8 consecutive lookups, building the result 4-bit at a time
+   **/
+  inline __device__ uint32_t get_len3_mask_32(uint32_t v0, uint32_t v1, uint32_t v2)
+  {
+    uint32_t m, v, m4, n;
+    v = v0;
+    m4 = k_len3lut[v & 0x3ff];    //: m4 = k_len3lut[v % 1024]
+    m = m4 & 0xf;           //: extract lower 4 bits (mask for 3 byte codes), m is the final mask!
+    n = m4 >> 4;          // 8..12      //: n stores upper 4 bits (bytes to code for four lengths in mask, 8..12)
+    v = v0 >> n;          //: shift: shifts 8..12 lower bits away, we have 8..12 upper bit zeros now in v!
+    m4 = k_len3lut[v & 0x3ff];    //: analyze next lower 10 bits
+    m |= (m4 & 0xf) << 4;       //: get the next 4-bit from mask4 and put it into the right spot in the result m
+    n += m4 >> 4;           // 16..24     //: add the len information from m4 (8..12) to the total len n
+    v = __funnelshift_r(v0, v1, n); //: shift: we need to use a funnel shift now, as we have 8..12 upper bit zeros in v, v1 gives us the respective missing bits => after every shift, we need to a funnelshit
+    m4 = k_len3lut[v & 0x3ff];    //: Look up next m4
+    m |= (m4 & 0xf) << 8;       //: get the next 4-bit from mask4 and put it into the right spot in the result m
+    n += m4 >> 4;           // 24..36     //: add the len information from m4 (8..12_ to the total len n
+    v >>= (m4 >> 4);        //: shift: Shift by the len information (8..12) fron m4 (not with n as this is the total len)
+    m4 = k_len3lut[v & 0x3ff];
+    m |= (m4 & 0xf) << 12;
+    n = (n + (m4 >> 4)) & 0x1f;    // (32..48) % 32 = 0..16  //: Attention(Transition to next variable):
+                     //: Total len n would now be bigger than v0. We need to access the next registers and shift by the v1 bits consumed previously
+    v1 = __funnelshift_r(v1, v2, n); //: We shift the previously consumed v1 bits away
+    v2 >>= n;            //: We shift the funneled v2 bits away as they are now stored in v
+    v = v1;
+    m4 = k_len3lut[v & 0x3ff];
+    m |= (m4 & 0xf) << 16;
+    n = m4 >> 4; // 8..12
+    v = v1 >> n;
+    m4 = k_len3lut[v & 0x3ff];
+    m |= (m4 & 0xf) << 20;
+    n += m4 >> 4; // 16..24
+    v = __funnelshift_r(v1, v2, n);
+    m4 = k_len3lut[v & 0x3ff];
+    m |= (m4 & 0xf) << 24;
+    n += m4 >> 4; // 24..36
+    v >>= (m4 >> 4);
+    m4 = k_len3lut[v & 0x3ff];
+    m |= (m4 & 0xf) << 28;
+    return m;
+  }
+
+  /**
+   * @brief Returns a 32-bit mask where each 2-bit pair contains the symbol length
+   * minus 2, given two input masks each containing bit0 or bit1 of the corresponding
+   * code length minus 2 for up to 32 bytes
+   **/
+  inline __device__ uint32_t get_len5_mask_32(uint32_t v0, uint32_t v1)
+  {
+    uint32_t m;
+    m = (v1 & 1) * 2 + (v0 & 1); //: m contains the code len - 2
+    v0 >>= (m + 2);        //: +2 to get actual code len
+    v1 >>= (m + 1);        //: TODO: Not sure why m+1 instead of m+2 ??
+    for (uint32_t i = 1; i < 16; i++)
+    {
+      uint32_t m2 = (v1 & 2) | (v0 & 1);
+      uint32_t n = m2 + 2; //: n is code len
+      m |= m2 << (i * 2);
+      v0 >>= n;
+      v1 >>= n;
+    }
+    return m;
+  }
+
+#define lo4(m4) ((m4) & 0xf)
+#define hi4(m4) ((m4) >> 4)
+#define lo10(v) ((v) & 0x3ff)
+#define lo_n(v) ((v) & ((1ull << n) - 1))
+  /**
+   * @brief Returns a 64-bit mask where 1 means 3-byte code length and 0 means 2-byte
+   * code length, given an input mask of up to 192 bits.
+   *
+   * Implemented by doing 16 consecutive lookups, building the result 4-bit at a time.
+   *
+   * Each lookup reads 10 bits from v0+v1+v2 and passes them to the k_len3lut lookup table.
+   * The 8-bit lookup table entries encodes a 4-bit mask about the length of the next 4 LZ77 symbols (1: 3 bytes, 0: 2 bytes)
+   * in the lower 4 bits and the aggregated length of the 4 LZ77 symbols (in bytes) in its upper 4 bits.
+   * As four 2-bytes symbols would have a length of 0=0b0000 while four 3-bytes symbols would have a length of 12=0b1100=0xc,
+   * the possible aggregated lengths are 8 ... 12 (0x8 ... 0xc).
+   *
+   * The lookup then adds the 4 mask bits to result mask and shifts the input registers v0+v1+v2 by the
+   * aggregrated symbol length.
+   *
+   * The whole process consumes 128 .. 192 bits of the three input registers v0+v1+v2.
+   **/
+  inline __device__ uint64_t get_len3_mask_64(uint64_t v0, uint64_t v1, uint64_t v2)
+  {
+    uint64_t m; // result
+    uint64_t m4;
+    uint64_t v;
+    uint32_t n;
+
+    v = v0;
+    // Five lookups within register v=v0:
+    m4 = k_len3lut[lo10(v)];
+    m = lo4(m4);
+    n = hi4(m4);
+    v = v0 >> n; // 8 .. 12
+    for (uint32_t i = 1; i < 5; i++)
+    { // 40 .. 60
+      m4 = k_len3lut[lo10(v)];
+      m |= lo4(m4) << (i * 4u);
+      n += hi4(m4);
+      v = v0 >> n;
+    }
+    // State:
+    // * m: 20=5*4 bits written at this stage
+    // * n=40 .. 60 orig. v0 bits consumed
+
+    // Shift across register boundaries v(v0) <-> v1 and v1 <-> v2:
+    v |= lo_n(v1) << (64u - n); // n=40...60
+    v0 = v;
+    v1 >>= n;
+    v1 |= lo_n(v2) << (64u - n);
+    v2 >>= n;
+    // State:
+    // * v/v0 is now a mix of 24 .. 4 bits from orig. v0 and 40 .. 60 bits from orig. v1
+    // * v1 is now a mix of 24 .. 4 bits from orig. v1 and 40 .. 60 bits from orig. v2
+
+    // Five lookups within register v
+    n = 0;
+    for (uint32_t i = 5; i < 10; i++)
+    { // 40 .. 60
+      m4 = k_len3lut[lo10(v)];
+      m |= lo4(m4) << (i * 4u);
+      n += hi4(m4);
+      v = v0 >> n;
+    }
+    // State:
+    // * m: 40=2*5*4 bits written at this stage
+    // * 80 .. 120 v0+v1 bits consumed:
+    //   * All 64 orig. v0 bits consumed
+    //   * 16 .. 56 orig. v1 bits consumed
+
+    // Shift across register boundaries v(v1) <-> v1(v1,v2) and v1(v1,v2) <-> v2:
+    v |= lo_n(v1) << (64u - n); // n = 40 .. 60
+    v0 = v;
+    v1 >>= n;
+    v1 |= lo_n(v2) << (64u - n);
+    // State:
+    // * v/v0 is now a mix of 8 .. 48 bits from orig. v1 plus 56 .. 16 bits from orig. v2
+    // * v1 now contains 8 .. 48 bits from orig. v2
+    // Implication:
+    // * All orig. v2 bits have been shifted to v1 and v/v0. Thus, var v2 can be ignored
+    //   from now on.
+    n = 0;
+    for (uint32_t i = 10; i < 15; i++)
+    { // 40 .. 60
+      m4 = k_len3lut[lo10(v)];
+      m |= lo4(m4) << (i * 4u);
+      n += hi4(m4);
+      v = v0 >> n;
+    }
+    // State:
+    // 60=3*5*4 m bits written at this stage
+    // 120 .. 180 v0+v1/v0+v1+v2 bits consumed at this stage
+    v |= lo_n(v1) << (64u-n);
+    constexpr uint32_t i = 15;
+    m4 = k_len3lut[lo10(v)];
+    m |= lo4(m4) << (i * 4u); // write last 4 bits
+    // State:
+    // 64=16*4 m bits written at this stage
+    // 128 .. 192 v0+v1/v0+v1+v2 bits consumed at this stage
+    return m;
+  }
+#undef lo4
+#undef hi4
+#undef lo10
+#undef lo_n
+
+  /**
+   * @brief Returns a 64-bit mask where each 2-bit pair contains the symbol length
+   * minus 2, given two input masks each containing bit0 or bit1 of the corresponding
+   * code length minus 2 for up to 64 bytes
+   **/
+  inline __device__ uint64_t get_len5_mask_64(uint64_t v0, uint64_t v1)
+  {
+    uint64_t m;
+    m = (v1 & 1) * 2 + (v0 & 1); //: m[0:2] <- [v1[0], v0[0]], m in [0,3] => len in [2,5]
+    v0 >>= (m + 2);        //: +2 to get actual code len
+    v1 >>= (m + 1);        //: TODO: Not sure why m+1 instead of m+2 ??
+    for (uint32_t i = 1; i < 64 / 2; i++)
+    {
+      uint64_t m2 = (v1 & 2) | (v0 & 1);
+      uint64_t n = m2 + 2;
+      m |= m2 << (i * 2);
+      v0 >>= n;
+      v1 >>= n;
+    }
+    return m;
+  }
+
+  template <typename RET_MASK_TYPE, typename ARG_MASK_TYPE>
+  __device__ inline RET_MASK_TYPE get_len3_mask(ARG_MASK_TYPE v0, ARG_MASK_TYPE v1, ARG_MASK_TYPE v2);
+
+  template <typename RET_MASK_TYPE, typename ARG_MASK_TYPE>
+  __device__ inline RET_MASK_TYPE get_len5_mask(ARG_MASK_TYPE v0, ARG_MASK_TYPE v1);
+
+#if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+  template<> __device__ inline uint32_t get_len3_mask<uint32_t, uint64_t>(uint64_t v0, uint64_t v1, uint64_t v2)
+  {
+    return get_len3_mask_32(*reinterpret_cast<uint32_t *>(&v0), *reinterpret_cast<uint32_t *>(&v1), *reinterpret_cast<uint32_t *>(&v2));
+  }
+
+  template<> __device__ inline uint64_t get_len3_mask<uint64_t, uint64_t>(uint64_t v0, uint64_t v1, uint64_t v2)
+  {
+    return get_len3_mask_64(v0, v1, v2);
+  }
+
+  template<> __device__ inline uint32_t get_len5_mask<uint32_t, uint64_t>(uint64_t v0, uint64_t v1)
+  {
+    return get_len5_mask_32(*reinterpret_cast<uint32_t *>(&v0), *reinterpret_cast<uint32_t *>(&v1));
+  }
+
+  template<> __device__ inline uint64_t get_len5_mask<uint64_t, uint64_t>(uint64_t v0, uint64_t v1)
+  {
+    return get_len5_mask_64(v0, v1);
+  }
+#else
+  template<> __device__ inline uint32_t get_len3_mask<uint32_t, uint32_t>(uint32_t v0, uint32_t v1, uint32_t v2)
+  {
+    return get_len3_mask_32(v0, v1, v2);
+  }
+
+  template<> __device__ inline uint32_t get_len5_mask<uint32_t, uint32_t>(uint32_t v0, uint32_t v1)
+  {
+    return get_len5_mask_32(v0, v1);
+  }
+#endif
+
+  /**
+   * @brief Computes the start position of the symbol at index t based on a mask whose single bits specify the symbol lengths.
+   * 
+   * The bits in the `len3_mask` arugment encode the (assumed) symbol length + 2 (in bytes).
+   * For example, if a bit is 1, the respective symbol's length is (assumed to be) 3 (=2 + 1*1) while
+   * if it is 0, the respective symbol's length is (assumed to be) 2 (=2 + 0*1).
+   * As a symbols (assumed) start position depends on the (assumed) lengths of the previous symbols,
+   * the previous symbols' length must be aggregated and added to the symbol's own length.
+   * Here comes the __popc/__popcll device builtin into play that counts the set bits in an 32-bit/64-bit integer.
+   */
+  template <typename GROUPMASK_T>
+  __device__ inline uint32_t compute_symbol_position_via_len3_mask(uint32_t t, uint32_t cur, GROUPMASK_T len3_mask) {
+    constexpr GROUPMASK_T GROUPMASK_ONE = 1;
+    return cur + 2 * t + num_set_bits(len3_mask & ((GROUPMASK_ONE << t) - GROUPMASK_ONE));
+  }
+
+  /**
+   * @brief Computes the start position of the symbol at index t based on a mask whose bit pairs specifies the symbol lengths.
+   * 
+   * The bit pairs in the `len5_mask` argument encode the (assumed) symbol length + 2 (in bytes).
+   * For example, if a bit pair is 0b11, the respective symbol's length is (assumed to be) 5 (=2 + 1*2 + 1*1) while
+   * if it is 0b00, the respective symbol's length is (assumed to be) 2 (=2 + 0*2 + 0*1).
+   * As a symbols (assumed) start position depends on the (assumed) lengths of the previous symbols,
+   * the previous symbols' length must be aggregated and added to the symbol's own length.
+   * Here comes the __popc/__popcll device builtin into play that counts the set bits in an 32-bit/64-bit integer.
+   * 
+   * \param[in] cur the current warp read position.
+   * \param[in] len5_mask a mask whose bit pairs encode the length of the next `sizeof(GROUPMASK_T)/2` symbols.
+   */
+  template <typename GROUPMASK_T>
+  __device__ inline uint32_t compute_symbol_position_via_len5_mask(uint32_t t, uint32_t cur,  GROUPMASK_T len5_mask);
+
+  template <>
+  __device__ inline uint32_t compute_symbol_position_via_len5_mask<uint32_t>(uint32_t t, uint32_t cur,  uint32_t len5_mask) {
+    constexpr uint32_t MASK_EVERY_ODD_BIT =  0xaaaaaaaa; //: 0b1010..1010
+    constexpr uint32_t MASK_EVERY_EVEN_BIT = 0x55555555; //: 0b0101..0101
+    constexpr uint32_t GROUPMASK_ONE = 1;
+    uint32_t mask_t    = (GROUPMASK_ONE << (2 * t)) - 1; //: 0b0..,0b11..,0b1111,..,0b111111..
+    return cur + 2 * t + 2 * num_set_bits((len5_mask & MASK_EVERY_ODD_BIT) & mask_t) + num_set_bits((len5_mask & MASK_EVERY_EVEN_BIT) & mask_t);
+  }
+
+  template <>
+  __device__ inline uint32_t compute_symbol_position_via_len5_mask<uint64_t>(uint32_t t, uint32_t cur,  uint64_t len5_mask) {
+    constexpr uint64_t MASK_EVERY_ODD_BIT = 0xaaaaaaaaaaaaaaaaull;  //: 0b1010..1010 for 64 bit
+    constexpr uint64_t MASK_EVERY_EVEN_BIT = 0x5555555555555555ull; //: 0b0101..0101 for 64 bit
+    constexpr uint64_t GROUPMASK_ONE = 1;
+    uint64_t mask_t    = (GROUPMASK_ONE << (2 * t)) - 1; //: 0b0..,0b11..,0b1111,..,0b111111..
+    return cur + 2 * t + 2 * num_set_bits((len5_mask & MASK_EVERY_ODD_BIT) & mask_t) + num_set_bits((len5_mask & MASK_EVERY_EVEN_BIT) & mask_t);
+  }
+
+} // namespace snappy
+
+} // namespace hipcomp
+
+#endif // SNAPPY_DECOMPRESSION_DECODER_WARP_SCANS_HIPH

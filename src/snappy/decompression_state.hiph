@@ -1,0 +1,129 @@
+
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// MIT License
+//
+// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#ifndef SNAPPY_DECOMPRESSION_STATE_HIPH
+#define SNAPPY_DECOMPRESSION_STATE_HIPH
+
+#include "snappy/symbol.hiph"
+
+using namespace hipcomp::snappy;
+
+namespace hipcomp {
+namespace snappy {
+
+/**
+ * \brief Queue structure used to exchange data between warps
+ * \note The `buf` array stores bytes prefetched by the snappy_prefetch_bytestream device
+ *       function. The snappy_decode_symbols device function (warp 0) writes into 
+ * \note The `batch` array stores BATCH_SIZE LZ77 symbols that
+ *       the snappy_process_symbols device function processes.
+ **/
+struct unsnap_queue_s {
+  uint32_t prefetch_wrpos;         ///< Prefetcher write position
+  uint32_t prefetch_rdpos;         ///< Prefetch consumer read position
+  int32_t prefetch_end;            ///< Prefetch enable flag (nonzero stops prefetcher)
+  int32_t batch_len[BATCH_COUNT];  ///< Length of each batch - <0:end, 0:not ready, >0:symbol count
+  uint32_t batch_prefetch_rdpos[BATCH_COUNT];
+  LZ77Symbol batch[BATCH_COUNT * BATCH_SIZE];  ///< LZ77 batch data
+  uint8_t buf[PREFETCH_SIZE];                      ///< Prefetch buffer
+
+public:
+  
+  /** 
+   * \brief Read from shared memory buffer if lane t is part of the group.
+   */
+  template <unsigned GROUPSIZE=uwarpsize, unsigned WARPSIZE=uwarpsize>
+  __device__ inline uint8_t read_byte(uint32_t t,uint32_t pos) volatile {
+    return ( GROUPSIZE != WARPSIZE && t >= GROUPSIZE)
+           ? 0 
+           : this->buf[(pos) & (PREFETCH_SIZE - 1)];
+  }
+  
+  /**
+   * \brief Computes offset for short symbols up to 5 bytes total length (incl. tag_byte)
+   *        except for copy symbols with 4 offset bytes.
+   * 
+   * \note The caller must ensure that no tag byte of a copy with 4 offset bytes is passed
+   *       to this routine!
+   * \note Returns the negative value of `cur_t+1` as offset for literals. 
+   * \note This routine is associated with `unsnap_queue_s` instead of `LZ77Symbol`
+   *       as it may need additional bytes from the shared memory buffer `buf`
+   *       depending on the symbol kind encoded into `tag_byte`.
+   * \note Assumes that the caller ensures that the calling thread is part of the group!
+   */
+  __device__ inline int32_t decode_short_symbol_offset__no_copy_with_4_offset_bytes(uint32_t tag_byte,uint32_t cur_t) volatile {
+      // Original code:
+      // ofs  = (b0 & 1) ? ((b0 & 0xe0) << 3) | s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t + 1)
+      //                : (b0 & 2) ? s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t + 1) | (s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t + 2) << 8)
+      //                           : -(int32_t)(cur_t + 1);
+      return LZ77Symbol::match_copy_with_1_or_4_offset_bytes(tag_byte)
+              ? LZ77Symbol::decode_offset_for_copy_with_1_offset_byte(tag_byte,this->read_byte(0,cur_t + 1))
+              : LZ77Symbol::match_copy_with_2_or_4_offset_bytes(tag_byte)
+                ? LZ77Symbol::decode_offset_for_copy_with_2_offset_bytes(this->read_byte(0,cur_t + 1),this->read_byte(0,cur_t + 2))
+                : -(int32_t)(cur_t + 1); //: offset for literal
+  }
+};
+
+/**
+ * \brief Input parameters for the decompression interface
+ **/
+ struct gpu_input_parameters {
+  const void *srcDevice;
+  uint64_t srcSize;
+  void *dstDevice;
+  uint64_t dstSize;
+};
+
+/**
+ * \brief snappy decompression state
+ **/
+struct unsnap_state_s {
+  const uint8_t *base;         ///< base ptr of compressed stream
+  const uint8_t *end;          ///< end of compressed stream
+  uint32_t uncompressed_size;  ///< uncompressed stream size
+  uint32_t bytes_left;         ///< bytes to uncompressed remaining
+  int32_t error;               ///< current error status
+  uint32_t tstart;             ///< start time for perf logging
+  volatile unsnap_queue_s q;   ///< queue for cross-warp communication
+  gpu_input_parameters in;      ///< input parameters for current block
+};
+
+} // namespace snappy
+} // namespace hipcomp
+
+#endif // SNAPPY_DECOMPRESSION_STATE_HIPH

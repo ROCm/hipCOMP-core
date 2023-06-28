@@ -1,0 +1,135 @@
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// MIT License
+//
+// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#ifndef SNAPPY_DECOMPRESSION_PREFETCH_HIPH
+#define SNAPPY_DECOMPRESSION_PREFETCH_HIPH
+
+#include "device_types.h"
+#include "device_functions.hiph"
+#include "snappy/config.h"
+#include "snappy/types.h"
+#include "snappy/symbol.hiph"
+#include "snappy/decompression_state.hiph"
+
+namespace hipcomp
+{
+  namespace snappy
+  {
+
+    /**
+     * Prefetch byte stream strategy that needs
+     * to be passed ot the PrefetchByteStream class.
+     */
+    template <typename GROUPMASK_T, typename WARPMASK_T>
+    class PrefetchByteStream
+    {
+    private:
+      static constexpr unsigned GROUPSIZE= sizeof(GROUPMASK_T) * 8;
+      static constexpr unsigned WARPSIZE = sizeof(WARPMASK_T) * 8;
+
+    public:
+      /**
+       * \brief Applies the strategy.
+       *
+       * \param[inout] s decompression state
+       * \param[in] t warp lane index, i.e. threadIdx.x % WARPSIZE.
+       */
+      __device__ static inline void apply(unsnap_state_s *s, const int t)
+      {
+
+        if (GROUPSIZE != WARPSIZE && t >= GROUPSIZE) //: always false if GROUPSIZE==WARPSIZE
+          return;
+
+        const uint8_t *base = s->base;
+        uint32_t end = (uint32_t)(s->end - base);
+        uint32_t align_bytes = (uint32_t)(GROUPSIZE - ((GROUPSIZE - 1) & reinterpret_cast<uintptr_t>(base)));
+        int32_t pos = min(align_bytes, end);
+        int32_t blen;
+        // Start by prefetching up to the next a (GROUPSIZE)B-aligned location
+        if (t < pos)
+        {
+          s->q.buf[t] = base[t];
+        }
+        blen = 0;
+        do
+        {
+          SYNCWARP(); //: only relevant for NVIDIA
+          if (!t)
+          {
+            uint32_t minrdpos;
+            s->q.prefetch_wrpos = pos;
+            minrdpos = pos - min(pos, PREFETCH_SIZE - PREFETCH_SECTORS * GROUPSIZE);
+            blen = (int)min(PREFETCH_SECTORS * GROUPSIZE, end - pos);
+            for (;;)
+            {
+              uint32_t rdpos = s->q.prefetch_rdpos;
+              if (rdpos >= minrdpos)
+                break;
+              if (s->q.prefetch_end)
+              {
+                blen = 0;
+                break;
+              }
+              NANOSLEEP(PREFETCH_SLEEP_NS);
+            }
+          }
+          blen = SHFL10(blen);
+          if (blen == PREFETCH_SECTORS * GROUPSIZE)
+          {
+            uint8_t vals[PREFETCH_SECTORS];
+            for (int i = 0; i < PREFETCH_SECTORS; ++i)
+              vals[i] = base[pos + t + i * GROUPSIZE];
+            for (int i = 0; i < PREFETCH_SECTORS; ++i)
+              s->q.buf[(pos + t + i * GROUPSIZE) & (PREFETCH_SIZE - 1)] = vals[i];
+          }
+          else
+          {
+#pragma unroll 1
+            for (int elem = t; elem < blen; elem += GROUPSIZE)
+            {
+              s->q.buf[(pos + elem) & (PREFETCH_SIZE - 1)] = base[pos + elem];
+            }
+          }
+          pos += blen;
+        } while (blen > 0);
+      }
+    };
+
+  } // namespace hipcomp
+} // namespace snappy
+
+#endif // SNAPPY_DECOMPRESSION_PREFETCH_HIPH

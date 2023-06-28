@@ -1,0 +1,349 @@
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// MIT License
+//
+// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#ifndef SNAPPY_DECOMPRESSION_DECODER_STRATEGIES_HIPH
+#define SNAPPY_DECOMPRESSION_DECODER_STRATEGIES_HIPH
+
+#include "snappy/config.h"
+#include "snappy/decompression_decode_warp_scans.hiph"
+
+// Decoder stage
+namespace hipcomp {
+namespace snappy {
+
+  /**
+   * \brief Decode as many as 2 and 3 byte long Snappy symbols as possible.
+   *
+   * Snappy Decoder Strategy
+   * -----------------------
+   *
+   * This decoder strategy can deal with Snappy Literal symbols of length 1 and 2 (in bytes), which consume 2 and 3 bytes.
+   * together with the tag byte, respectively.
+   * It further can deal with Snappy Copy symbols with 1 and 2 offset bytes, which consume 2 and 3 bytes
+   * together with their tag byte, respectively.
+   *
+   * Motivation:
+   *
+   * For data that does not get good compression,
+   * the stream will consist of a large number of short literals (1-byte or 2-byte)
+   * followed by short repeat runs (copy symbols). This results in many 2-byte or 3-byte symbols
+   * that can all be decoded in parallel once we know the symbol length.
+   *
+   * This strategy class does not have any state, it only provides a static device member function `apply` that is assumed
+   * to be inlined aggressively. If any larger symbol is encountered, the strategy stops at that location and returns the updated state
+   * up to this point via inout parameters. The caller then takes over and tries the next strategy.
+   *
+   * \note Warp-level device function, must be called by all threads/lanes of a warp.
+   * \note Choosing GROUPMASK_T bigger than than WARPSIZE_T will result in undefined behavior.
+   * \note Choosing GROUPMASK_T other than uint32_t or uint64_t will result in undefined behavior.
+   * \note A GROUPMASK_T of uint32_t will yield a maximum batch_len of 32, even in the case being WARPSIZE 64.
+   * \note A GROUPMASK_T of uint64_t will yield a maximum batch_len of 64 (only applicable for case WARPMASK_T=uint64_t).
+   */
+  template <typename GROUPMASK_T,typename WARPMASK_T>
+  class TryDecodeStringOf2To3ByteSymbols {
+  private:
+    static constexpr unsigned GROUPSIZE=sizeof(GROUPMASK_T)*8;
+    static constexpr unsigned WARPSIZE=sizeof(WARPMASK_T)*8;
+    static constexpr GROUPMASK_T GROUPMASK_ZERO = 0;
+    static constexpr GROUPMASK_T GROUPMASK_ONE = 1;
+
+    /**
+     * \brief if this is a copy with 4 offset bytes or literal with length
+     * greater than 2 (excl. tag byte).
+     */
+    __device__ static inline int match_long_literal_or_copy_with_4_offset_bytes(uint32_t tag_byte) {
+      // Code:
+      // ((b0 & ~4) != 0) && (((b0 + 1) & 2) == 0)
+      // Analysis:
+      // 1) ((b0 & ~4) != 0:
+      // 4 = 0b000001 00 -> ~4 = 0b111110 11 -> either copy or literal of length >= 3 (excl. tag byte) (b0 >= 0b000010 00); 0b000010 is the literal length - 1.
+      // 2) (b0 + 1) & 2 == 0:
+      // satisfied for literals with tag byte b0 = 0bXXXX XX00
+      // not satisfied for copy with 1 byte offset, tag byte b0 == 0bXXXX XX01
+      // not satisfied for copy with 2 byte offset, tag byte b0 == 0bXXXX XX10
+      // satisfied for copy with 4 byte offset, tag byte b0 == 0bXXXX XX11, due to carry
+      return ((tag_byte & ~4) != 0) && (((tag_byte + 1) & 2) == 0);
+    }
+  public:
+    /**
+      * \brief Applies this strategy.
+      *
+      * \return The tag byte who caused the strategy to abort.
+      *
+      * \note Argument `b` is modified by this routine and is thus passed as reference.
+      *
+      * \param[inout] s the decompression context/state.
+      * \param[inout] cur the current read position of the decoder warp, i.e. thread/lane 0.
+      * \param[inout] bytes_left the number of bytes still left to uncompress.
+      * \param[inout] dst_pos the write position in the output buffer.
+      * \param[inout] b pointer to the batch of symbols that will be decoded/are already decoded.
+      *                 This volatile pointer is modified and is thus passed as reference.
+      * \param[inout] batch_len number of symbols that have been already decoded in the current batch, is always zero initially when this function is called!
+      * \param[in]    t warp lane/thread index, i.e. threadIdx.x % GROUPSIZE
+     */
+    __device__ static inline uint32_t apply(
+        unsnap_state_s* s,       //: inout
+        uint32_t& cur,           //: inout
+        uint32_t& bytes_left,    //: inout
+        uint32_t& dst_pos,       //: inout
+        volatile LZ77Symbol*& b, //: inout, reference is important, as b may be modified
+        int32_t& batch_len,      //: inout, zero initially when this function is called.
+        const int t
+    ) {
+      uint32_t cur_t, is_long_sym;
+      GROUPMASK_T v0, v1, v2, len3_mask, short_sym_mask;
+      uint32_t b0;
+      cur            = SHFL10(cur);
+      cur_t          = cur + t;
+      b0             = s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t + 0*GROUPSIZE);
+      v0             = ballot1<GROUPMASK_T,WARPSIZE>(t,LZ77Symbol::match_3_bytes_long_symbol__no_copy_with_4_offset_bytes(b0));
+      b0             = s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t + 1*GROUPSIZE);
+      v1             = ballot1<GROUPMASK_T,WARPSIZE>(t,LZ77Symbol::match_3_bytes_long_symbol__no_copy_with_4_offset_bytes(b0));
+      b0             = s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t + 2*GROUPSIZE);
+      v2             = ballot1<GROUPMASK_T,WARPSIZE>(t,LZ77Symbol::match_3_bytes_long_symbol__no_copy_with_4_offset_bytes(b0));
+      //: identical: len3_mask      = get_len3_mask(v0, v1, v2);
+      len3_mask      = SHFL10((t == 0) ? get_len3_mask<GROUPMASK_T,WARPMASK_T>(v0,v1,v2) : GROUPMASK_ZERO);
+      cur_t          = compute_symbol_position_via_len3_mask<GROUPMASK_T>(t, cur, len3_mask);
+      b0             = s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t);
+      is_long_sym    = match_long_literal_or_copy_with_4_offset_bytes(b0);
+      short_sym_mask = ballot1<GROUPMASK_T,WARPSIZE>(t,is_long_sym);
+      batch_len      = 0;
+      b = reinterpret_cast<volatile LZ77Symbol *>(SHFL10(reinterpret_cast<uintptr_t>(b)));
+
+      if (!(short_sym_mask & 1)) {
+        //: identical: batch_len = short_sym_mask ? (find_first_set_bit(short_sym_mask) - 1): warpsize;
+        batch_len = SHFL10((t == 0) ? (short_sym_mask) ? find_first_set_bit(short_sym_mask) - 1 : warpsize : 0);
+        if (batch_len != 0) {
+          uint32_t blen = 0;
+          int32_t ofs   = 0;
+          if (t < batch_len) {
+            //: batch_len < GROUP_SIZE
+            blen = LZ77Symbol::decode_short_symbol_len__no_copy_with_4_offset_bytes(b0);
+            ofs  = s->q.decode_short_symbol_offset__no_copy_with_4_offset_bytes(b0,cur_t);
+            b[t].set(blen,ofs,cur_t," (2-to-3)");
+            ofs += blen;  // for correct out-of-range detection below
+          }
+          blen           = WarpReduce<GROUPSIZE,WARPSIZE>::prefix_sum(t, blen);
+          bytes_left     = SHFL10(bytes_left); //: input, return
+          dst_pos        = SHFL10(dst_pos);    //: input, return
+
+          // limit symbol batch len
+          uint32_t first_out_of_range = find_first_set_bit(ballot1<GROUPMASK_T,WARPSIZE>(t, blen > bytes_left || ofs > (int32_t)(dst_pos + blen)));
+          if (first_out_of_range != 0) {
+            batch_len = min(batch_len, first_out_of_range - 1);
+          }
+
+          if (batch_len != 0) {
+            blen = SHFL1(blen, batch_len - 1);
+            cur  = SHFL1(cur_t, batch_len - 1) + 2 + ((len3_mask >> (batch_len - 1)) & 1);
+            //: opt?: Should be the same as cur <- SHFL1(cur_t,batch_len) if batch_len < GROUP_SIZE ??
+            if (t == 0) {
+              #ifdef HIPCOMP_PRINT_DEBUG_INFO
+              printf("cur=%d, batch_len=%d, v0=%lu, v1=%lu, v2=%lu, len3_mask=%lu (lane 0 state after 2-to-3)\n",cur,batch_len,v0,v1,v2,len3_mask);
+              #endif
+              dst_pos += blen;
+              bytes_left -= blen;
+            }
+          }
+        }
+      }
+      return SHFL1(b0, batch_len);
+    }
+  };
+
+
+  template <typename GROUPMASK_T=warp_mask_t,typename WARPMASK_T=warp_mask_t> // dummy template parms with no impact
+  class TryDecodeStringOf2To3ByteSymbolsNoOp {
+  public:
+    /**
+     * \brief Applies this strategy.
+     *
+     * \return The tag byte who caused the strategy to abort, i.e.
+     *         always the first byte (read by warp lane 0).
+     */
+    __device__ static inline uint32_t apply(
+        unsnap_state_s* s,       //: inout
+        uint32_t& cur,           //: inout
+        uint32_t& bytes_left,    //: inout
+        uint32_t& dst_pos,       //: inout
+        volatile LZ77Symbol*& b, //: inout, reference is important, as b may be modified
+        int32_t& batch_len,      //: inout, zero initially when this function is called.
+        const int t
+    ) {
+      return SHFL10((t == 0) ? s->q.read_byte(0,cur) : 0);
+    }
+  };
+
+  /**
+   * \brief Decode as many as 2, 3, 4, and 5 byte Snappy symbols as possible.
+   *
+   * Snappy Decoder Strategy
+   * -----------------------
+   *
+   * Slower version of TryDecodeStringOf2To3ByteSymbols that alsos takes 4 and 5 byte Snappy symbols
+   * into account. Stops when encountering literals with length > 4 (excl. tag byte) and copy
+   * symbols with 4 offset bytes.
+   *
+  * \note Warp-level device function, must be called by all threads/lanes of a warp.
+  * \note Choosing GROUPMASK_T bigger than than WARPSIZE_T will result in undefined behavior.
+  * \note Choosing GROUPMASK_T other than uint32_t or uint64_t will result in undefined behavior.
+  * \note A GROUPMASK_T of uint32_t will yield a maximum batch_len of 32, even in the case being WARPSIZE 64.
+  * \note A GROUPMASK_T of uint64_t will yield a maximum batch_len of 64 (only applicable for case WARPMASK_T=uint64_t).
+   */
+  template <typename GROUPMASK_T,typename WARPMASK_T>
+  class TryDecodeStringOf2To5ByteSymbols {
+  private:
+      constexpr static unsigned GROUPSIZE=sizeof(GROUPMASK_T)*8;
+      constexpr static unsigned WARPSIZE=sizeof(WARPMASK_T)*8;
+      constexpr static GROUPMASK_T GROUPMASK_ZERO = 0;
+      constexpr static GROUPMASK_T GROUPMASK_ONE = 1;
+
+      /**
+       * \brief if this is a copy with 4 offset bytes or literal with length
+       * greater than 4 (excl. tag byte).
+       */
+      __device__ static inline int match_long_literal_or_copy_with_4_offset_bytes(uint32_t tag_byte) {
+        return LZ77Symbol::match_copy(tag_byte)
+               ? LZ77Symbol::match_copy_with_4_offset_bytes(tag_byte)
+               : LZ77Symbol:: match_literal_with_len_gt_4__no_copy(tag_byte);
+      }
+
+  public:
+    /**
+      * \brief Applies this strategy.
+      *
+      * \param[inout] s the decompression context/state.
+      * \param[inout] cur the current read position of the decoder warp, i.e. thread/lane 0.
+      * \param[inout] bytes_left the number of bytes still left to uncompress.
+      * \param[inout] dst_pos the write position in the output buffer.
+      * \param[inout] b pointer to the batch of symbols that will be decoded/are already decoded.
+      *                 This volatile pointer may be modified and is thus passed as reference.
+      * \param[inout] batch_len number of symbols that have been already decoded in the current batch. May not be zero
+      *               if another trategy has become active before.
+      * \param[in]    t warp lane/thread index, i.e. threadIdx.x % GROUPSIZE
+      */
+    __device__ static inline void apply(
+        unsnap_state_s* s,
+        uint32_t& cur,           //: inout
+        uint32_t& bytes_left,    //: inout
+        uint32_t& dst_pos,       //: inout
+        volatile LZ77Symbol*& b, //: inout
+        int32_t& batch_len,      //: inout
+        const int t
+    ) {
+      uint32_t cur_t, first_excluded_symbol;
+      GROUPMASK_T v0, v1, len5_mask, short_sym_mask;
+      uint32_t b0;
+
+      // If so, run a slower version of the above that can also handle 3/4-byte literal sequences
+      uint32_t batch_add;
+      do {
+        uint32_t clen;
+        GROUPMASK_T mask_t;
+        cur_t     = cur + t;
+        b0        = s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t);
+        clen      = LZ77Symbol::decode_symbol_num_bytes__no_copy_with_4_offset_bytes(b0) - 2;
+        //clen      = (b0 & 3) ? (b0 & 2) ? 1 : 0 : (b0 >> 2);
+        v0        = ballot1<GROUPMASK_T,WARPSIZE>(t,clen & 1);
+        v1        = ballot1<GROUPMASK_T,WARPSIZE>(t,(clen >> 1) & 1);
+
+        //: identical len5_mask = get_len5_mask(v0, v1);
+        len5_mask   = SHFL10((t == 0) ? get_len5_mask<GROUPMASK_T,WARPMASK_T>(v0, v1) : 0);
+        cur_t       = compute_symbol_position_via_len5_mask<GROUPMASK_T>(t, cur, len5_mask);
+        b0          = s->q.read_byte<GROUPSIZE,WARPSIZE>(t,cur_t);
+
+        //first_excluded_symbol = ((b0 & 3) ? ((b0 & 3) == 3) : (b0 > 3 * 4)) || (cur_t >= cur + GROUPSIZE) ||
+        //                (batch_len + t >= BATCH_SIZE);
+        first_excluded_symbol =
+            match_long_literal_or_copy_with_4_offset_bytes(b0)
+            || (cur_t >= cur + GROUPSIZE)
+            || (batch_len + t >= BATCH_SIZE);
+        batch_add = find_first_set_bit(ballot1<GROUPMASK_T,WARPSIZE>(t,first_excluded_symbol)) - 1;
+          //: BEGIN roughly same as in previous approach, except flow statement conditions and some indices
+        if (batch_add != 0) { //: differs
+          uint32_t blen = 0;
+          int32_t ofs   = 0;
+          if (t < batch_add) { //: differs
+            blen = LZ77Symbol::decode_short_symbol_len__no_copy_with_4_offset_bytes(b0);
+            ofs  = s->q.decode_short_symbol_offset__no_copy_with_4_offset_bytes(b0,cur_t);
+            b[batch_len + t].set(blen,ofs,cur_t," (2-to-5)");
+            ofs += blen;  // for correct out-of-range detection below
+          }
+          blen           = WarpReduce<GROUPSIZE,WARPSIZE>::prefix_sum(t, blen);
+          //: blen           = WarpReducePos(blen, t);
+          bytes_left     = SHFL10(bytes_left);
+          dst_pos        = SHFL10(dst_pos);
+          short_sym_mask = find_first_set_bit(ballot1<GROUPMASK_T,WARPSIZE>(t,blen > bytes_left || ofs > (int32_t)(dst_pos + blen)));
+          if (short_sym_mask != 0) { batch_add = min(batch_add, short_sym_mask - 1); } //: differs
+          if (batch_add != 0) { //: differs
+            blen = SHFL1(blen, batch_add - 1); //: differs
+            cur  = SHFL1(cur_t, batch_add - 1) + 2 + ((len5_mask >> ((batch_add - 1) * 2)) & 3); //: differs
+            if (t == 0) {
+              dst_pos += blen;
+              bytes_left -= blen;
+            }
+            batch_len += batch_add; //: added
+          }
+        }
+        //: END roughly same as in previous approach, except flow statement conditions and some indices
+      } while (batch_add >= 6 && batch_len < BATCH_SIZE - 2);
+    }
+  };
+
+  template <typename GROUPMASK_T=warp_mask_t,typename WARPMASK_T=warp_mask_t> // dummy template parms with no impact
+  class TryDecodeStringOf2To5ByteSymbolsNoOp {
+  public:
+    /**
+     * \brief Applies this strategy.
+     */
+    __device__ static inline void apply(
+        unsnap_state_s* s,       //: inout
+        uint32_t& cur,           //: inout
+        uint32_t& bytes_left,    //: inout
+        uint32_t& dst_pos,       //: inout
+        volatile LZ77Symbol*& b, //: inout, reference is important, as b may be modified
+        int32_t& batch_len,      //: inout, zero initially when this function is called.
+        const int t
+    ) {
+      // do nothing
+    }
+  };
+
+} // namespace snappy
+} // namespace hipcomp
+
+#endif // SNAPPY_DECOMPRESSION_DECODER_STRATEGIES_HIPH

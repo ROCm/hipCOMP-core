@@ -1,0 +1,390 @@
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// MIT License
+//
+// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#ifndef SNAPPY_COMPRESSION_HIPH
+#define SNAPPY_COMPRESSION_HIPH
+
+#include "device_functions.hiph"
+#include "snappy/types.h"
+#include "snappy/compression_state.hiph"
+
+namespace hipcomp {
+namespace snappy {
+
+static inline __device__ uint32_t get_max_compressed_length(uint32_t source_bytes)
+{
+  // This is an estimate from the original snappy library 
+  return 32 + source_bytes + source_bytes / 6;
+}
+
+/**
+ * \brief 12-bit hash from four consecutive bytes
+ **/
+static inline __device__ uint32_t snap_hash(uint32_t v)
+{
+  return (v * ((1 << 20) + (0x2a00) + (0x6a) + 1)) >> (32 - HASH_BITS);
+}
+
+/**
+ * \brief Outputs a snappy literal symbol
+ *
+ * \param dst Destination compressed byte stream
+ * \param end End of compressed data buffer
+ * \param src Pointer to literal bytes
+ * \param len_minus1 Number of literal bytes minus 1
+ * \param t Thread in warp
+ *
+ * \return Updated pointer to compressed byte stream
+ **/
+template <unsigned GROUPSIZE,unsigned WARPSIZE>
+static inline __device__ uint8_t *StoreLiterals(
+  uint8_t *dst, uint8_t *end, const uint8_t *src, uint32_t len_minus1, uint32_t t)
+{
+  if (len_minus1 < 60) {
+    if (!t && dst < end) dst[0] = (len_minus1 << 2);
+    dst += 1;
+  } else if (len_minus1 <= 0xff) {
+    if (!t && dst + 1 < end) {
+      dst[0] = 60 << 2;
+      dst[1] = len_minus1;
+    }
+    dst += 2;
+  } else if (len_minus1 <= 0xffff) {
+    if (!t && dst + 2 < end) {
+      dst[0] = 61 << 2;
+      dst[1] = len_minus1;
+      dst[2] = len_minus1 >> 8;
+    }
+    dst += 3;
+  } else if (len_minus1 <= 0xffffff) {
+    if (!t && dst + 3 < end) {
+      dst[0] = 62 << 2;
+      dst[1] = len_minus1;
+      dst[2] = len_minus1 >> 8;
+      dst[3] = len_minus1 >> 16;
+    }
+    dst += 4;
+  } else {
+    if (!t && dst + 4 < end) {
+      dst[0] = 63 << 2;
+      dst[1] = len_minus1;
+      dst[2] = len_minus1 >> 8;
+      dst[3] = len_minus1 >> 16;
+      dst[4] = len_minus1 >> 24;
+    }
+    dst += 5;
+  }
+  if ( GROUPSIZE == WARPSIZE || t < GROUPSIZE ) {
+    for (uint32_t i = t; i <= len_minus1; i += GROUPSIZE) {
+      if (dst + i < end) dst[i] = src[i];
+    }
+  }
+  return dst + len_minus1 + 1;
+}
+
+/**
+ * \brief Outputs a snappy copy symbol (assumed to be called by a single thread)
+ *
+ * \param dst Destination compressed byte stream
+ * \param end End of compressed data buffer
+ * \param copy_len Copy length
+ * \param distance Copy distance
+ *
+ * \return Updated pointer to compressed byte stream
+ **/
+static inline __device__ uint8_t *StoreCopy(
+    uint8_t *dst,
+    uint8_t *end,
+    uint32_t copy_len,
+    uint32_t distance)
+{
+  if (copy_len < 12 && distance < 2048) {
+    // xxxxxx01.oooooooo: copy with 3-bit length, 11-bit offset
+    if (dst + 2 <= end) {
+      dst[0] = ((distance & 0x700) >> 3) | ((copy_len - 4) << 2) | 0x01;
+      dst[1] = distance;
+    }
+    return dst + 2;
+  } else {
+    // xxxxxx1x: copy with 6-bit length, 16-bit offset
+    if (dst + 3 <= end) {
+      dst[0] = ((copy_len - 1) << 2) | 0x2;
+      dst[1] = distance;
+      dst[2] = distance >> 8;
+    }
+    return dst + 3;
+  }
+} //: no warpsize dependency
+
+/**
+ * \brief Returns mask of any thread in the warp that has a hash value
+ * equal to that of the calling thread
+ **/
+template <typename GROUPMASK_T, typename SIGNED_GROUPMASK_T,unsigned WARPSIZE>
+static inline __device__ GROUPMASK_T HashMatchAny(uint32_t v, uint32_t t)  //: warp size dependent datatype
+{
+#if (__CUDA_ARCH__ >= 700)
+  return __match_any_sync(~0, v); //: special case for <uint32_t,int32_t,32u>
+#else
+  //: applies to AMD too
+  GROUPMASK_T err_map = 0;
+  for (uint32_t i = 0; i < HASH_BITS; i++, v >>= 1) {
+    uint32_t b       = v & 1;
+    GROUPMASK_T match_b = ballot1<GROUPMASK_T,WARPSIZE>(t,b);
+    err_map |= match_b ^ -(SIGNED_GROUPMASK_T)b; //: todo: get rid of SIGNED_GROUPMASK_T, express this xor differently
+  }
+  return ~err_map;
+#endif
+}
+
+/**
+ * \brief Finds the first occurence of a consecutive 4-byte match in the input sequence,
+ * or at most MAX_LITERAL_LENGTH bytes
+ *
+ * \param s Compressor state (copy_length set to 4 if a match is found, zero otherwise)
+ * \param src Uncompressed buffer
+ * \param pos0 Position in uncompressed buffer
+ * \param t thread in warp
+ *
+ * \return Number of bytes before first match (literal length)
+ * 
+ * \note Side effects:
+ * - Writes to `s(b).copy_distance`
+ * - Writes to `s(b).copy_length`
+ * - Writes to `s(b).hash_map`
+ **/
+template <typename GROUPMASK_T, typename SIGNED_GROUPMASK_T,unsigned WARPSIZE>
+static __device__ inline uint32_t FindFourByteMatch(
+    snap_state_s *s,
+    const uint8_t *src,
+    uint32_t pos0,
+    uint32_t t)
+{
+  constexpr unsigned GROUPSIZE = sizeof(GROUPMASK_T)*8;
+  constexpr GROUPMASK_T GROUP_MASK_ONE = 1;
+  constexpr GROUPMASK_T GROUPMASK_TWO = 2;
+
+  uint32_t len    = s->src_len;
+  uint32_t pos    = pos0;
+  uint32_t maxpos = pos0 + MAX_LITERAL_LENGTH - (GROUPSIZE - 1);
+  uint32_t literal_cnt;
+  GROUPMASK_T match_mask;
+  if (t == 0) { s->copy_length = 0; }
+  do {
+    bool valid4               = (pos + t + 4 <= len);
+    uint32_t data32           = (valid4) ? unaligned_load32(src + pos + t) : 0;
+    uint32_t hash             = (valid4) ? snap_hash(data32) : 0;
+    GROUPMASK_T local_match   = HashMatchAny<GROUPMASK_T,SIGNED_GROUPMASK_T,WARPSIZE>(hash, t);
+    uint32_t local_match_lane = (GROUPSIZE-1) - num_leading_zero_bits(local_match & ((GROUP_MASK_ONE << t) - 1));
+    uint32_t local_match_data = SHFL1(data32, min(local_match_lane, t));
+    uint32_t offset, match;
+    if (valid4) {
+      if (local_match_lane < t && local_match_data == data32) {
+        match  = 1;
+        offset = pos + local_match_lane;
+      } else {
+        offset = (pos & ~0xffff) | s->hash_map[hash];
+        if (offset >= pos) { offset = (offset >= 0x10000) ? offset - 0x10000 : pos; }
+        match =
+          (offset < pos && offset + MAX_COPY_DISTANCE >= pos + t && unaligned_load32(src + offset) == data32);
+      }
+    } else {
+      match       = 0;
+      local_match = 0;
+      offset      = pos + t;
+    }
+    match_mask = ballot1<GROUPMASK_T,WARPSIZE>(t,match);
+    if (match_mask != 0) {
+      literal_cnt = find_first_set_bit(match_mask) - 1;
+      if (t == literal_cnt) {
+        s->copy_distance = pos + t - offset;
+        s->copy_length   = 4;
+      }
+    } else {
+      literal_cnt = GROUPSIZE;
+    }
+    // Update hash up to the first 4 bytes of the copy length
+    local_match &= (GROUPMASK_TWO << literal_cnt) - 1;
+    if (t <= literal_cnt && t == (GROUPSIZE-1) - num_leading_zero_bits(local_match)) { s->hash_map[hash] = pos + t; }
+    pos += literal_cnt;
+  } while (literal_cnt == GROUPSIZE && pos < maxpos);
+  return min(pos, len) - pos0;
+}
+
+/// \brief Returns the number of matching bytes for two byte sequences up to 63 bytes
+//: this takes the max copy len of 64 into account.
+//: for amd only a a single work item is processed per thread
+template <typename GROUPMASK_T,typename WARPMASK_T>
+static __device__ inline uint32_t Match60(const uint8_t *src1,
+                                   const uint8_t *src2,
+                                   uint32_t len,
+                                   uint32_t t)
+{ 
+  constexpr unsigned WARPSIZE = sizeof(WARPMASK_T)*8;
+  constexpr unsigned GROUPSIZE = sizeof(GROUPMASK_T)*8;
+  GROUPMASK_T mismatch = ballot1<GROUPMASK_T,WARPSIZE>(t,t >= len || src1[t] != src2[t]);
+  if (GROUPSIZE == 64) { 
+    return find_first_set_bit(mismatch) - 1; // mismatch cannot be zero here if len <= 63
+  }
+  if (mismatch == 0) {
+    mismatch = ballot1<GROUPMASK_T,WARPSIZE>(t,32 + t >= len || src1[32 + t] != src2[32 + t]); 
+    return 31 + __ffs((uint32_t)mismatch);  // mismatch cannot be zero here if len <= 63
+  } else {
+    return __ffs((uint32_t)mismatch) - 1;
+  }
+} 
+
+/**
+ * \brief Snappy compression device function
+ * See http://github.com/google/snappy/blob/master/format_description.txt
+ *
+ * Device helper function that can be used to
+ *
+ * \param[in] inputs Source/Destination buffer information per block
+ * \param[out] outputs Compression status per block
+ * \param[in] count Number of blocks to compress
+ **/
+__device__ inline void
+do_snap(
+  const uint8_t* __restrict__ device_in_ptr,
+  const uint64_t device_in_bytes,
+  uint8_t* const __restrict__ device_out_ptr,
+  const uint64_t device_out_available_bytes,
+  gpu_snappy_status_s* __restrict__ outputs,
+	uint64_t* device_out_bytes)
+{
+  typedef warp_mask_t GROUPMASK_T;
+  typedef signed_warp_mask_t SIGNED_GROUPMASK_T;
+  typedef warp_mask_t WARPMASK_T;
+  constexpr unsigned WARPSIZE = sizeof(WARPMASK_T)*8;
+  constexpr unsigned GROUPSIZE = sizeof(GROUPMASK_T)*8;
+  
+  __shared__ __align__(16) snap_state_s state_g;
+
+  snap_state_s *const s = &state_g;
+  uint32_t t            = threadIdx.x;
+  uint32_t pos;
+  const uint8_t *src;
+
+  if (!t) {
+    const uint8_t *src = device_in_ptr;
+    uint32_t src_len   = static_cast<uint32_t>(device_in_bytes);
+    uint8_t *dst       = device_out_ptr;
+    uint32_t dst_len   = device_out_available_bytes;
+    if (dst_len == 0)
+      dst_len = get_max_compressed_length(src_len);
+
+    uint8_t *end       = dst + dst_len;
+    s->src             = src;
+    s->src_len         = src_len;
+    s->dst_base        = dst;
+    s->end             = end;
+    while (src_len > 0x7f) {
+      if (dst < end) { dst[0] = src_len | 0x80; }
+      dst++;
+      src_len >>= 7;
+    }
+    if (dst < end) { dst[0] = src_len; }
+    s->dst            = dst + 1;
+    s->literal_length = 0;
+    s->copy_length    = 0;
+    s->copy_distance  = 0;
+  }
+  //: NOTE: We interpreted the code below as initializing the hashmap entries to zero by means of uint32_t operations.
+  //: NOTE: The original CUDA implementation incremented with `i += 4*GROUPSIZE=128`, which
+  //: might leave some hashmap entries unitialized, e.g. those with index `i*2` in [128,255].
+  if ( GROUPSIZE == WARPSIZE || t < GROUPSIZE ) {
+    for (uint32_t i = t; i < sizeof(s->hash_map) / (2*sizeof(uint16_t)); i += 2*GROUPSIZE) {
+      *reinterpret_cast<volatile uint32_t *>(&s->hash_map[i * 2]) = 0;
+    }
+  }
+  __syncthreads();
+  src = s->src;
+  pos = 0;
+  while (pos < s->src_len) {
+    uint32_t literal_len = s->literal_length;
+    uint32_t copy_len    = s->copy_length;
+    uint32_t distance    = s->copy_distance;
+    __syncthreads();
+    if (t < WARPSIZE) {
+      // WARP0: Encode literals and copies
+      uint8_t *dst = s->dst;
+      uint8_t *end = s->end;
+      if (literal_len > 0) {
+        dst = StoreLiterals<GROUPSIZE,WARPSIZE>(dst, end, src + pos, literal_len - 1, t);
+        pos += literal_len;
+      }
+      if (copy_len > 0) {
+        if (t == 0) { dst = StoreCopy(dst, end, copy_len, distance); }
+        pos += copy_len;
+      }
+      SYNCWARP();
+      if (t == 0) { s->dst = dst; }
+    } else {
+      pos += literal_len + copy_len;
+      if (t < WARPSIZE * 2) {
+        // WARP1: Find a match using 12-bit hashes of 4-byte blocks
+        //: two-step strategy: first find 4-byte match, 
+        //: then try to find longer match starting from that match's position
+        uint32_t t5 = t & (WARPSIZE-1);
+        literal_len = FindFourByteMatch<GROUPMASK_T,SIGNED_GROUPMASK_T,WARPSIZE>(s, src, pos, t5); //: side effect: writes to s->copy_length
+        if (t5 == 0) { s->literal_length = literal_len; }
+        copy_len = s->copy_length;
+        if (copy_len != 0) {
+          uint32_t match_pos = pos + literal_len + copy_len;  // NOTE: copy_len is always 4 here
+          copy_len += Match60<GROUPMASK_T,WARPMASK_T>(src + match_pos,
+                              src + match_pos - s->copy_distance,
+                              min(s->src_len - match_pos, 64 - copy_len), //: copy_len is 4 here
+                              t5);
+          if (t5 == 0) { s->copy_length = copy_len; }
+        }
+      }
+    }
+    __syncthreads();
+  }
+  __syncthreads();
+  if (!t) {
+    *device_out_bytes = s->dst - s->dst_base;
+    if (outputs)
+      outputs->status = (s->dst > s->end) ? 1 : 0;
+  }
+}
+
+} // namespace snappy
+} // namespace hipcomp
+
+#endif // SNAPPY_COMPRESSION_HIPH
