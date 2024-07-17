@@ -79,6 +79,15 @@ public:
   static void api_call(hipcompStatus_t err, const std::string &filename,
                        const int line);
 
+  static void hip_api_call(hipError_t err, const std::string &filename,
+                           const int line);
+
+  /**
+   * Print a debug message.
+   */
+  static void log_debug(const std::string &message, const std::string &filename,
+                        const int line);
+
   // NOTE: there is no C++11/C++14 standard way to get the function name.
   // In the future we could try to handle major compilers, and get the
   // name that way, as well as use the c++20 method.
@@ -91,18 +100,28 @@ private:
 
 } // namespace hipcomp
 
-#define CHECK_API_CALL(call) Check::api_call(call, __FILE__, __LINE__)
+#define CHECK_API_CALL(call) hipcomp::Check::api_call(call, __FILE__, __LINE__)
 
-#define CHECK_EQ(a, b) Check::equal(a, b, #a, #b, __FILE__, __LINE__)
+#define CHECK_HIP_API_CALL(call)                                               \
+  hipcomp::Check::hip_api_call(call, __FILE__, __LINE__)
 
-#define CHECK_NOT_NULL(ptr) Check::not_null(ptr, #ptr, __FILE__, __LINE__)
+#define CHECK_EQ(a, b) hipcomp::Check::equal(a, b, #a, #b, __FILE__, __LINE__)
+
+#define CHECK_NOT_NULL(ptr)                                                    \
+  hipcomp::Check::not_null(ptr, #ptr, __FILE__, __LINE__)
+
+#ifdef HIPCOMP_DEBUG_OUTPUT
+#define LOG_DEBUG(msg) hipcomp::Check::log_debug(msg, __FILE__, __LINE__)
+#else
+#define LOG_DEBUG(msg)
+#endif
 
 #define API_WRAPPER(call, func_name)                                           \
   [](auto err) {                                                               \
     try {                                                                      \
-      Check::api_call(err, __FILE__, __LINE__);                                \
+      hipcomp::Check::api_call(err, __FILE__, __LINE__);                       \
     } catch (const std::exception &e) {                                        \
-      return Check::exception_to_error(e, func_name);                          \
+      return hipcomp::Check::exception_to_error(e, func_name);                 \
     }                                                                          \
     return err;                                                                \
   }(call)

@@ -55,6 +55,8 @@ typedef enum hipcompStatus_t {
   hipcompErrorInvalidValue = 10,
   hipcompErrorNotSupported = 11,
   hipcompErrorCannotDecompress = 12,
+  hipcompErrorOutOfMemory = 13, ///< Output buffer is too small; operation can
+                                ///< succeed with larger output
   hipcompErrorCudaError = 1000,
   hipcompErrorInternal = 10000,
   nvcompSuccess = hipcompSuccess,
@@ -63,4 +65,6 @@ typedef enum hipcompStatus_t {
   nvcompErrorCannotDecompress = hipcompErrorCannotDecompress,
   nvcompErrorCudaError = hipcompErrorCudaError,
   nvcompErrorInternal = hipcompErrorInternal,
+  hipcompInternalSkipped = 10002 ///< Operation skipped (if conversion,
+                                 ///< uncompressed data can be used)
 } hipcompStatus_t;

@@ -145,7 +145,12 @@ template <typename T, typename MaskT>
 __device__ inline T SHFL1_XOR(T v, const MaskT m) {
   return __shfl_xor(v, m);
 }
-__device__ inline void SYNCWARP() { return; }
+__device__ inline void SYNCWARP() {
+  /* sync/barrier all threads in a warp */
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+  __builtin_amdgcn_wave_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
 // BALLOT1 specializations
 template <> __device__ inline Mask32 BALLOT1(int predicate) {
 #ifdef __HIP_PLATFORM_AMD__

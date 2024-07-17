@@ -85,6 +85,8 @@ const size_t hipcompSnappyRequiredAlignment = 1;
 hipcompStatus_t hipcompBatchedSnappyDecompressGetTempSize(
     size_t num_chunks, size_t max_uncompressed_chunk_size, size_t *temp_bytes);
 
+// # TODO check which interface is the correct one
+
 /**
  * @brief Compute uncompressed sizes.
  *

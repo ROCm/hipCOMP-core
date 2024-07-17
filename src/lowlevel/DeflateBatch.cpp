@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2017-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -25,6 +25,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
 // MIT License
 //
 // Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
@@ -49,67 +50,93 @@
 // SOFTWARE.
 
 #include "Check.h"
-
+#include "DeflateBatchKernels.h"
+#include "HipUtils.h"
+#include "common.h"
 #include "hip/hip_runtime_api.h"
+#include "hipcomp.h"
+#include "hipcomp.hpp"
+#include "hipcomp/deflate.h"
+#include "type_macros.h"
 
-namespace hipcomp {
+#include <cassert>
+#include <iostream>
+#include <list>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <vector>
+
+using namespace hipcomp;
 
 /******************************************************************************
- * PUBLIC STATIC METHODS ******************************************************
+ *     C-style API calls for BATCHED compression/decompress defined below.
  *****************************************************************************/
 
-void Check::not_null(const void *const ptr, const std::string &name,
-                     const std::string &filename, const int line) {
-  if (ptr == nullptr) {
-    print_fail_position(filename, line);
-    throw std::runtime_error("'" + name + "' must not be null.");
-  }
-}
+hipcompStatus_t hipcompBatchedDeflateDecompressGetTempSize(
+    size_t compressed_data_size, size_t chunk_size, size_t *temp_bytes) {
+  try {
+    // error check inputs
+    CHECK_NOT_NULL(temp_bytes);
 
-void Check::api_call(const hipcompStatus_t err, const std::string &filename,
-                     const int line) {
-  if (err != hipcompSuccess) {
-    print_fail_position(filename, line);
-    throw HipCompException(err, "API CALL FAILED");
-  }
-}
+    // Gzip doesn't need any workspace in GPU memory
+    *temp_bytes = 0;
 
-void Check::hip_api_call(const hipError_t err, const std::string &filename,
-                         const int line) {
-  if (err != hipSuccess) {
-    print_fail_position(filename, line);
-    throw HipCompException(hipcompErrorCudaError, "HIP API CALL FAILED");
-  }
-}
-
-hipcompStatus_t Check::exception_to_error(const std::exception &e,
-                                          const std::string &function_name) {
-  std::string context;
-  if (!function_name.empty()) {
-    context = "In " + function_name + ": ";
+  } catch (const std::exception &e) {
+    return Check::exception_to_error(
+        e, "hipcompBatchedDeflateCompressGetTempSize()");
   }
 
-  // generic error
-  hipcompStatus_t err = hipcompErrorInvalidValue;
+  return hipcompSuccess;
+}
 
-  // NOTE: this depends on RTTI being enabled.
-  if (dynamic_cast<const HipCompException *>(&e)) {
-    const HipCompException &nve = dynamic_cast<const HipCompException &>(e);
-    err = nve.get_error();
+hipcompStatus_t hipcompBatchedDeflateGetDecompressSizeAsync(
+    const void *const *device_compressed_ptrs, /* unused */
+    const size_t *device_compressed_bytes, size_t *device_uncompressed_bytes,
+    size_t batch_size, hipStream_t stream) {
+  try {
+    // error check inputs
+    CHECK_NOT_NULL(device_compressed_ptrs);
+    CHECK_NOT_NULL(device_compressed_bytes);
+    CHECK_NOT_NULL(device_uncompressed_bytes);
+
+    gpu_get_uncompressed_sizes_estimate(
+        device_compressed_bytes, device_uncompressed_bytes, batch_size, stream);
+
+  } catch (const std::exception &e) {
+    return Check::exception_to_error(
+        e, "hipcompBatchedDeflateGetDecompressSizeAsync()");
   }
 
-  std::cerr << "ERROR: " << context << e.what() << std::endl;
-  return err;
+  return hipcompSuccess;
 }
 
-void Check::print_fail_position(const std::string &filename, const int line) {
-  std::cerr << "CHECK FAILED: " << filename << ":" << line << std::endl;
-}
+hipcompStatus_t hipcompBatchedDeflateDecompressAsync(
+    const void *const *device_compressed_ptrs,
+    const size_t *device_compressed_bytes,
+    const size_t *device_uncompressed_bytes,
+    size_t *device_actual_uncompressed_bytes, size_t batch_size,
+    void *const /* temp_ptr */, const size_t /* temp_bytes */,
+    void *const *device_uncompressed_ptr, hipcompStatus_t *device_statuses,
+    hipStream_t stream) {
+  try {
+    // error check inputs
+    CHECK_NOT_NULL(device_compressed_ptrs);
+    CHECK_NOT_NULL(device_compressed_bytes);
+    CHECK_NOT_NULL(device_uncompressed_bytes);
+    CHECK_NOT_NULL(device_uncompressed_ptr);
 
-void Check::log_debug(const std::string &message, const std::string &filename,
-                      const int line) {
-  std::cerr << "[DEBUG] " << filename << ":" << line << ": " << message
-            << std::endl;
-}
+    gpu_inflate(device_compressed_ptrs, device_compressed_bytes,
+                device_uncompressed_ptr, device_uncompressed_bytes,
+                device_statuses, device_actual_uncompressed_bytes,
+                nullptr,           // device_reserved
+                batch_size, false, /* parse_hdr */
+                stream);
 
-} // namespace hipcomp
+  } catch (const std::exception &e) {
+    return Check::exception_to_error(e,
+                                     "hipcompBatchedDeflateDecompressAsync()");
+  }
+
+  return hipcompSuccess;
+}

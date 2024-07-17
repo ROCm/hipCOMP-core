@@ -64,6 +64,7 @@ option(
   CG_WORKAROUND
   "Use HIP cooperative groups workaround that is shipped with this project. Has no effect on CUDA builds."
   OFF)
+option(DEBUG_OUTPUT "Switch on debug messages." OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_HIP_STANDARD 17)
@@ -150,6 +151,10 @@ macro(setup_hip_amd_build)
 endmacro()
 
 # ##############################################################################
+
+if(DEBUG_OUTPUT)
+  add_compile_definitions(HIPCOMP_DEBUG_OUTPUT)
+endif()
 
 if(CUDA_BACKEND)
   setup_cuda_build()

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -25,6 +25,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
 // MIT License
 //
 // Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
@@ -48,68 +49,29 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "Check.h"
+#pragma once
 
-#include "hip/hip_runtime_api.h"
+#include "hipcomp.h"
+#include "hipcomp_common_deps/hlif_shared_types.hpp"
 
 namespace hipcomp {
 
-/******************************************************************************
- * PUBLIC STATIC METHODS ******************************************************
- *****************************************************************************/
+// TODO(HIP/AMD): Currently not supported
+// void deflateHlifBatchCompress(
+//     const CompressArgs& compress_args,
+//     const uint32_t max_ctas,
+//     hipStream_t stream);
 
-void Check::not_null(const void *const ptr, const std::string &name,
-                     const std::string &filename, const int line) {
-  if (ptr == nullptr) {
-    print_fail_position(filename, line);
-    throw std::runtime_error("'" + name + "' must not be null.");
-  }
-}
+void deflateHlifBatchDecompress(const uint8_t *comp_buffer,
+                                uint8_t *decomp_buffer,
+                                const size_t raw_chunk_size, uint32_t *ix_chunk,
+                                const size_t num_chunks,
+                                const size_t *comp_chunk_offsets,
+                                const size_t *comp_chunk_sizes,
+                                const uint32_t max_ctas, hipStream_t stream,
+                                hipcompStatus_t *output_status);
 
-void Check::api_call(const hipcompStatus_t err, const std::string &filename,
-                     const int line) {
-  if (err != hipcompSuccess) {
-    print_fail_position(filename, line);
-    throw HipCompException(err, "API CALL FAILED");
-  }
-}
-
-void Check::hip_api_call(const hipError_t err, const std::string &filename,
-                         const int line) {
-  if (err != hipSuccess) {
-    print_fail_position(filename, line);
-    throw HipCompException(hipcompErrorCudaError, "HIP API CALL FAILED");
-  }
-}
-
-hipcompStatus_t Check::exception_to_error(const std::exception &e,
-                                          const std::string &function_name) {
-  std::string context;
-  if (!function_name.empty()) {
-    context = "In " + function_name + ": ";
-  }
-
-  // generic error
-  hipcompStatus_t err = hipcompErrorInvalidValue;
-
-  // NOTE: this depends on RTTI being enabled.
-  if (dynamic_cast<const HipCompException *>(&e)) {
-    const HipCompException &nve = dynamic_cast<const HipCompException &>(e);
-    err = nve.get_error();
-  }
-
-  std::cerr << "ERROR: " << context << e.what() << std::endl;
-  return err;
-}
-
-void Check::print_fail_position(const std::string &filename, const int line) {
-  std::cerr << "CHECK FAILED: " << filename << ":" << line << std::endl;
-}
-
-void Check::log_debug(const std::string &message, const std::string &filename,
-                      const int line) {
-  std::cerr << "[DEBUG] " << filename << ":" << line << ": " << message
-            << std::endl;
-}
+size_t deflateHlifDecompMaxBlockOccupancy(const int device_id);
+// size_t deflateHlifCompMaxBlockOccupancy(const int device_id);
 
 } // namespace hipcomp
