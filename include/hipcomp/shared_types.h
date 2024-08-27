@@ -57,4 +57,10 @@ typedef enum hipcompStatus_t
   hipcompErrorCannotDecompress = 12,
   hipcompErrorCudaError = 1000,
   hipcompErrorInternal = 10000,
+  nvcompSuccess = hipcompSuccess,
+  nvcompErrorInvalidValue = hipcompErrorInvalidValue,
+  nvcompErrorNotSupported = hipcompErrorNotSupported,
+  nvcompErrorCannotDecompress = hipcompErrorCannotDecompress,
+  nvcompErrorCudaError = hipcompErrorCudaError,
+  nvcompErrorInternal = hipcompErrorInternal,
 } hipcompStatus_t;
