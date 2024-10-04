@@ -196,7 +196,7 @@ template <typename GROUPMASK_T,unsigned WARPSIZE>
 __device__ inline GROUPMASK_T ballot1(uint32_t t, int predicate,int predicate_excluded = 0);
 
 // ballot1 specializations
-#if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(USE_WARPSIZE_64)
 template <>
 __device__ inline uint64_t ballot1<uint64_t,64u>(uint32_t t,int predicate,int predicate_excluded) {
   return BALLOT1(predicate);
@@ -224,7 +224,7 @@ public:
 };
 
 // Warp reduction helpers
-#if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(USE_WARPSIZE_64)
 template <typename T> inline __device__ T WarpReduceSum2(T acc)     { return acc + SHFL1_XOR(acc, 1); }
 template <typename T> inline __device__ T WarpReduceSum4(T acc)     { acc = WarpReduceSum2(acc); return acc + SHFL1_XOR(acc, 2); }
 template <typename T> inline __device__ T WarpReduceSum8(T acc)     { acc = WarpReduceSum4(acc); return acc + SHFL1_XOR(acc, 4); }

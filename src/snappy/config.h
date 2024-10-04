@@ -43,7 +43,7 @@
 // Decompression default settings that can be influenced via compiler flags
 
 #ifndef LOG2_BATCH_SIZE
-#  if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#  if defined(USE_WARPSIZE_64)
      // results in BATCH_SIZE 64 (LZ77 symbols)
 #    define LOG2_BATCH_SIZE 6
 #  else

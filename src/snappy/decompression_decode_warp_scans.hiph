@@ -331,7 +331,7 @@ namespace snappy
   template <typename RET_MASK_TYPE, typename ARG_MASK_TYPE>
   __device__ inline RET_MASK_TYPE get_len5_mask(ARG_MASK_TYPE v0, ARG_MASK_TYPE v1);
 
-#if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(USE_WARPSIZE_64)
   template<> __device__ inline uint32_t get_len3_mask<uint32_t, uint64_t>(uint64_t v0, uint64_t v1, uint64_t v2)
   {
     return get_len3_mask_32(*reinterpret_cast<uint32_t *>(&v0), *reinterpret_cast<uint32_t *>(&v1), *reinterpret_cast<uint32_t *>(&v2));

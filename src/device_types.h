@@ -25,8 +25,14 @@
 
 namespace hipcomp {
 
+#if !defined(USE_WARPSIZE_32)
+# if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#   define USE_WARPSIZE_64
+#  endif
+#endif
+
 // Snappy GPU types
-#if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(USE_WARPSIZE_64)
 typedef uint64_t warp_mask_t;
 typedef int64_t signed_warp_mask_t;
 #else

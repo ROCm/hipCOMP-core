@@ -70,7 +70,7 @@ namespace hipcomp
 namespace
 {
 constexpr const size_t ALIGN_OFFSET = 256;
-#ifdef __HIP_PLATFORM_AMD__
+#ifdef USE_WARPSIZE_64
 constexpr const int WARP_SIZE = 64;
 #else
 #  if __CUDACC_VER_MAJOR__ >= 9

@@ -62,6 +62,12 @@
 #include <iostream>
 #include <vector>
 
+#if !defined(USE_WARPSIZE_64) && !defined(USE_WARPSIZE_32)
+# if defined(__HIP_PLATFORM_HCC__) || defined(__HIP_PLATFORM_AMD__)
+#   define USE_WARPSIZE_64
+#  endif
+#endif
+
 #if (__CUDACC_VER_MAJOR__ >= 9)
 #  define SHFL10(v)        __shfl_sync(~0, v, 0)
 #  define SHFL1(v, t)      __shfl_sync(~0, v, t)
@@ -78,7 +84,7 @@
 #  define BALLOT1(v)       __ballot(v)
 #endif
 
-#if (defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)) && defined (ENABLE_HIP_OPT_WAVESIZE64)
+#if (defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)) && defined (ENABLE_HIP_OPT_WAVESIZE64) && defined(USE_WARPSIZE_64)
 typedef uint64_t lane_mask_t;
 typedef int64_t signed_lane_mask_t;
 constexpr lane_mask_t LANE_MASK_FULL = ~0ULL;
