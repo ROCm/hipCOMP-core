@@ -66,16 +66,18 @@ Mark Adler    madler@alumni.caltech.edu
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#pragma once
+
+#include "decompression_decode.cuh"
+#include "decompression_prefetch.cuh"
+#include "decompression_process.cuh"
 #include "device_functions.cuh"
 #include "hip/hip_runtime.h"
 
 #include <hipcub/hipcub.hpp>
 
-// TODO(HIP/AMD): Double-check meaning of launch_bounds HIP vs CUDA
-constexpr int DECOMP_THREADS_PER_BLOCK = warpSize * 4;
-
 namespace hipcomp {
-namespace gzip {
+namespace deflate {
 
 /**
  * @brief GZIP header flags
@@ -88,979 +90,6 @@ constexpr uint8_t fextra = 0x04;   // Extra fields present
 constexpr uint8_t fname = 0x08;    // Original file name present
 constexpr uint8_t fcomment = 0x10; // Comment present
 }; // namespace GZIPHeaderFlag
-
-constexpr int max_bits = 15;     // maximum bits in a code
-constexpr int max_l_codes = 286; // maximum number of literal/length codes
-constexpr int max_d_codes = 30;  // maximum number of distance codes
-constexpr int fix_l_codes = 288; // number of fixed literal/length codes
-
-constexpr int log2_len_lut = 10;
-constexpr int log2_dist_lut = 8;
-
-/**
- * @brief Intermediate arrays for building huffman tables
- */
-struct scratch_arr {
-  int16_t lengths[max_l_codes + max_d_codes]; ///< descriptor code lengths
-  int16_t
-      offs[max_bits + 1]; ///< offset in symbol table for each length (scratch)
-};
-
-/**
- * @brief Huffman LUTs for length and distance codes
- */
-struct lut_arr {
-  int32_t lenlut[1 << log2_len_lut];   ///< LUT for length decoding
-  int32_t distlut[1 << log2_dist_lut]; ///< LUT for fast distance decoding
-};
-
-/// 4 batches of 32 symbols
-constexpr int log2_batch_count = 2; // 1..5
-#ifdef __HIP_PLATFORM_AMD__
-//: results in BATCH_SIZE 64
-constexpr int log2_batch_size = 6;
-#else
-constexpr int log2_batch_size = 5;
-#endif
-constexpr int batch_count = (1 << log2_batch_count);
-constexpr int batch_size = (1 << log2_batch_size);
-
-/**
- * @brief Inter-warp communication queue
- */
-struct xwarp_s {
-  int32_t batch_len[batch_count]; //< Length of each batch - <0:end, 0:not
-                                  // ready, >0:symbol count
-  union {
-    uint32_t symqueue[batch_count * batch_size];
-    uint8_t symqueue8[batch_count * batch_size * 4];
-  } u;
-};
-
-#define ENABLE_PREFETCH 1
-
-#if ENABLE_PREFETCH
-#ifdef __HIP_PLATFORM_AMD__
-// TODO(HIP/AMD): Fine-tune these parameters.
-// We need a prefetch size of >=2^10 = 1024 bytes here.
-// At batch_size = 2^6 = 64 for HIP AMD backend, wavefront 0
-// requires the prefetcher (wavefront 2) to have prefetched at least 64 * 6 =
-// 384 bytes before proceeding with process_symbols(). However, with
-// prefetch_size<=2^9 = 512 bytes, the prefetcher would only fetch 256 bytes
-// (some space is left on purpose in the buffer), which would cause some unit
-// tests to hang.
-constexpr int log2_prefetch_size = 10; // Must be at least LOG2_BATCH_SIZE+3
-#else
-constexpr int log2_prefetch_size = 9; // Must be at least LOG2_BATCH_SIZE+3
-#endif
-constexpr int prefetch_size = (1 << log2_prefetch_size);
-
-/// @brief Prefetcher state
-struct prefetch_queue_s {
-  uint8_t const *cur_p; ///< Prefetch location
-  int run;              ///< prefetcher will exit when run=0
-  uint8_t pref_data[prefetch_size];
-};
-
-template <typename T>
-inline __device__ volatile uint32_t *
-prefetch_addr32(volatile prefetch_queue_s &q, T *ptr) {
-  return reinterpret_cast<volatile uint32_t *>(
-      &q.pref_data[(prefetch_size - 4) & (size_t)(ptr)]);
-}
-
-#endif // ENABLE_PREFETCH
-
-/**
- * @brief Inflate decompressor state
- */
-struct inflate_state_s {
-  // output state
-  uint8_t *out;     ///< output buffer
-  uint8_t *outbase; ///< start of output buffer
-  uint8_t *outend;  ///< end of output buffer
-  // Input state
-  uint8_t const *cur; ///< input buffer
-  uint8_t const *end; ///< end of input buffer
-
-  uint2 bitbuf;    ///< bit buffer (64-bit)
-  uint32_t bitpos; ///< position in bit buffer
-
-  int32_t err;             ///< Error status
-  int btype;               ///< current block type
-  int blast;               ///< last block
-  uint32_t stored_blk_len; ///< length of stored (uncompressed) block
-
-  uint16_t first_slow_len; ///< first code not in fast LUT
-  uint16_t index_slow_len;
-  uint16_t first_slow_dist;
-  uint16_t index_slow_dist;
-
-  volatile xwarp_s x;
-#if ENABLE_PREFETCH
-  volatile prefetch_queue_s pref;
-#endif
-
-  int16_t lencnt[max_bits + 1];
-  int16_t lensym[fix_l_codes]; // Assumes fix_l_codes >= max_l_codes
-  int16_t distcnt[max_bits + 1];
-  int16_t distsym[max_d_codes];
-
-  union {
-    scratch_arr scratch;
-    lut_arr lut;
-  } u;
-};
-
-inline __device__ unsigned int bfe(unsigned int source, unsigned int bit_start,
-                                   unsigned int num_bits) {
-  // TODO(HIP/AMD): check if we have an equivalent ISA instruction/intrinsic
-  // that can be used here unsigned int bits; asm("bfe.u32 %0, %1, %2, %3;" :
-  // "=r"(bits) : "r"(source), "r"(bit_start), "r"(num_bits));
-  return hipcub::BFE(source, bit_start, num_bits);
-};
-
-inline __device__ uint32_t showbits(inflate_state_s *s, uint32_t n) {
-  uint32_t next32 = __funnelshift_rc(s->bitbuf.x, s->bitbuf.y, s->bitpos);
-  return (next32 & ((1 << n) - 1));
-}
-
-inline __device__ uint32_t nextbits32(inflate_state_s *s) {
-  return __funnelshift_rc(s->bitbuf.x, s->bitbuf.y, s->bitpos);
-}
-
-inline __device__ void skipbits(inflate_state_s *s, uint32_t n) {
-  uint32_t bitpos = s->bitpos + n;
-  if (bitpos >= 32) {
-    auto cur = s->cur + 8;
-    s->bitbuf.x = s->bitbuf.y;
-    s->bitbuf.y = (cur < s->end) ? *reinterpret_cast<uint32_t const *>(cur) : 0;
-    s->cur = cur - 4;
-    bitpos &= 0x1f;
-  }
-  s->bitpos = bitpos;
-}
-
-// TODO: If we require 4-byte alignment of input bitstream & length (padded),
-// reading bits would become quite a bit faster
-__device__ uint32_t getbits(inflate_state_s *s, uint32_t n) {
-  uint32_t v = showbits(s, n);
-  skipbits(s, n);
-  return v;
-}
-
-/**
- * @brief Decode a code from the stream s using huffman table {symbols,counts}.
- * Return the symbol or a negative value if there is an error.
- * If all of the lengths are zero, i.e. an empty code, or if the code is
- * incomplete and an invalid code is received, then -10 is returned after
- * reading max_bits bits.
- *
- * Format notes:
- *
- * - The codes as stored in the compressed data are bit-reversed relative to
- *   a simple integer ordering of codes of the same lengths.  Hence below the
- *   bits are pulled from the compressed data one at a time and used to
- *   build the code value reversed from what is in the stream in order to
- *   permit simple integer comparisons for decoding.  A table-based decoding
- *   scheme (as used in zlib) does not need to do this reversal.
- *
- * - The first code for the shortest length is all zeros.  Subsequent codes of
- *   the same length are simply integer increments of the previous code.  When
- *   moving up a length, a zero bit is appended to the code.  For a complete
- *   code, the last code of the longest length will be all ones.
- *
- * - Incomplete codes are handled by this decoder, since they are permitted
- *   in the deflate format.  See the format notes for fixed() and dynamic().
- */
-__device__ int decode(inflate_state_s *s, int16_t const *counts,
-                      int16_t const *symbols) {
-  unsigned int len;   // current number of bits in code
-  unsigned int code;  // len bits being decoded
-  unsigned int first; // first code of length len
-  unsigned int count; // number of codes of length len
-  uint32_t next32r = __brev(nextbits32(s));
-
-  first = 0;
-  for (len = 1; len <= max_bits; len++) {
-    code = (next32r >> (32 - len)) - first;
-    count = counts[len];
-    if (code < count) // if length len, return symbol
-    {
-      skipbits(s, len);
-      return symbols[code];
-    }
-    symbols += count; // else update for next length
-    first += count;
-    first <<= 1;
-  }
-  return -10; // ran out of codes
-}
-
-/**
- * @brief Given the list of code lengths length[0..n-1] representing a canonical
- * Huffman code for n symbols, construct the tables required to decode those
- * codes.  Those tables are the number of codes of each length, and the symbols
- * sorted by length, retaining their original order within each length.  The
- * return value is zero for a complete code set, negative for an over-
- * subscribed code set, and positive for an incomplete code set.  The tables
- * can be used if the return value is zero or positive, but they cannot be used
- * if the return value is negative.  If the return value is zero, it is not
- * possible for decode() using that table to return an error--any stream of
- * enough bits will resolve to a symbol.  If the return value is positive, then
- * it is possible for decode() using that table to return an error for received
- * codes past the end of the incomplete lengths.
- *
- * Not used by decode(), but used for error checking, count[0] is the number
- * of the n symbols not in the code.  So n - count[0] is the number of
- * codes.  This is useful for checking for incomplete codes that have more than
- * one symbol, which is an error in a dynamic block.
- *
- * Assumption: for all i in 0..n-1, 0 <= length[i] <= max_bits
- * This is assured by the construction of the length arrays in dynamic() and
- * fixed() and is not verified by construct().
- *
- * Format notes:
- *
- * - Permitted and expected examples of incomplete codes are one of the fixed
- *   codes and any code with a single symbol which in deflate is coded as one
- *   bit instead of zero bits.  See the format notes for fixed() and dynamic().
- *
- * - Within a given code length, the symbols are kept in ascending order for
- *   the code bits definition.
- */
-__device__ int construct(inflate_state_s *s, int16_t *counts, int16_t *symbols,
-                         int16_t const *length, int n) {
-  int symbol; // current symbol when stepping through length[]
-  int len;    // current length when stepping through counts[]
-  int left;   // number of possible codes left of current length
-  int16_t *offs = s->u.scratch.offs;
-
-  // count number of codes of each length
-  for (len = 0; len <= max_bits; len++)
-    counts[len] = 0;
-  for (symbol = 0; symbol < n; symbol++)
-    (counts[length[symbol]])++; // assumes lengths are within bounds
-  if (counts[0] == n)           // no codes!
-    return 0;                   // complete, but decode() will fail
-
-  // check for an over-subscribed or incomplete set of lengths
-  left = 1; // one possible code of zero length
-  for (len = 1; len <= max_bits; len++) {
-    left <<= 1;          // one more bit, double codes left
-    left -= counts[len]; // deduct count from possible codes
-    if (left < 0)
-      return left; // over-subscribed--return negative
-  } // left > 0 means incomplete
-
-  // generate offsets into symbol table for each length for sorting
-  offs[1] = 0;
-  for (len = 1; len < max_bits; len++)
-    offs[len + 1] = offs[len] + counts[len];
-
-  // put symbols in table sorted by length, by symbol order within each length
-  for (symbol = 0; symbol < n; symbol++)
-    if (length[symbol] != 0)
-      symbols[offs[length[symbol]]++] = symbol;
-
-  // return zero for complete set, positive for incomplete set
-  return left;
-}
-
-/// permutation of code length codes
-static const __device__ __constant__ uint8_t g_code_order[19 + 1] = {
-    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15, 0xff};
-
-/// Dynamic block (custom huffman tables)
-__device__ int init_dynamic(inflate_state_s *s) {
-  int nlen, ndist, ncode; /* number of lengths in descriptor */
-  int index;              /* index of lengths[] */
-  int err;                /* construct() return value */
-  int16_t *lengths = s->u.scratch.lengths;
-
-  // get number of lengths in each table, check lengths
-  nlen = getbits(s, 5) + 257;
-  ndist = getbits(s, 5) + 1;
-  ncode = getbits(s, 4) + 4;
-  if (nlen > max_l_codes || ndist > max_d_codes) {
-    return -3; // bad counts
-  }
-  // read code length code lengths (really), missing lengths are zero
-  for (index = 0; index < ncode; index++)
-    lengths[g_code_order[index]] = getbits(s, 3);
-  for (; index < 19; index++)
-    lengths[g_code_order[index]] = 0;
-
-  // build huffman table for code lengths codes (use lencode temporarily)
-  err = construct(s, s->lencnt, s->lensym, lengths, 19);
-  if (err != 0) // require complete code set here
-    return -4;
-
-  // read length/literal and distance code length tables
-  index = 0;
-  while (index < nlen + ndist) {
-    int symbol = decode(s, s->lencnt, s->lensym);
-    if (symbol < 0)
-      return symbol; // invalid symbol
-    if (symbol < 16) // length in 0..15
-      lengths[index++] = symbol;
-    else {                // repeat instruction
-      int len = 0;        // last length to repeat, assume repeating zeros
-      if (symbol == 16) { // repeat last length 3..6 times
-        if (index == 0)
-          return -5;              // no last length!
-        len = lengths[index - 1]; // last length
-        symbol = 3 + getbits(s, 2);
-      } else if (symbol == 17) // repeat zero 3..10 times
-        symbol = 3 + getbits(s, 3);
-      else // == 18, repeat zero 11..138 times
-        symbol = 11 + getbits(s, 7);
-      if (index + symbol > nlen + ndist)
-        return -6;     // too many lengths!
-      while (symbol--) // repeat last or zero symbol times
-        lengths[index++] = len;
-    }
-  }
-
-  // check for end-of-block code -- there better be one!
-  if (lengths[256] == 0)
-    return -9;
-
-  // build huffman table for literal/length codes
-  err = construct(s, s->lencnt, s->lensym, lengths, nlen);
-  if (err && (err < 0 || nlen != s->lencnt[0] + s->lencnt[1]))
-    return -7; // incomplete code ok only for single length 1 code
-
-  // build huffman table for distance codes
-  err = construct(s, s->distcnt, s->distsym, &lengths[nlen], ndist);
-  if (err && (err < 0 || ndist != s->distcnt[0] + s->distcnt[1]))
-    return -8; // incomplete code ok only for single length 1 code
-
-  return 0;
-}
-
-/**
- * @brief Initializes a fixed codes block.
- *
- * Format notes:
- *
- * - This block type can be useful for compressing small amounts of data for
- *   which the size of the code descriptions in a dynamic block exceeds the
- *   benefit of custom codes for that block.  For fixed codes, no bits are
- *   spent on code descriptions.  Instead the code lengths for literal/length
- *   codes and distance codes are fixed.  The specific lengths for each symbol
- *   can be seen in the "for" loops below.
- *
- * - The literal/length code is complete, but has two symbols that are invalid
- *   and should result in an error if received.  This cannot be implemented
- *   simply as an incomplete code since those two symbols are in the "middle"
- *   of the code.  They are eight bits long and the longest literal/length\
- *   code is nine bits.  Therefore the code must be constructed with those
- *   symbols, and the invalid symbols must be detected after decoding.
- *
- * - The fixed distance codes also have two invalid symbols that should result
- *   in an error if received.  Since all of the distance codes are the same
- *   length, this can be implemented as an incomplete code.  Then the invalid
- *   codes are detected while decoding.
- */
-__device__ int init_fixed(inflate_state_s *s) {
-  int16_t *lengths = s->u.scratch.lengths;
-  int symbol;
-
-  // literal/length table
-  for (symbol = 0; symbol < 144; symbol++)
-    lengths[symbol] = 8;
-  for (; symbol < 256; symbol++)
-    lengths[symbol] = 9;
-  for (; symbol < 280; symbol++)
-    lengths[symbol] = 7;
-  for (; symbol < fix_l_codes; symbol++)
-    lengths[symbol] = 8;
-  construct(s, s->lencnt, s->lensym, lengths, fix_l_codes);
-
-  // distance table
-  for (symbol = 0; symbol < max_d_codes; symbol++)
-    lengths[symbol] = 5;
-
-  // build huffman table for distance codes
-  construct(s, s->distcnt, s->distsym, lengths, max_d_codes);
-
-  return 0;
-}
-
-/**
- * @brief Decode literal/length and distance codes until an end-of-block code.
- *
- * Format notes:
- *
- * - Compressed data that is after the block type if fixed or after the code
- *   description if dynamic is a combination of literals and length/distance
- *   pairs terminated by and end-of-block code.  Literals are simply Huffman
- *   coded bytes.  A length/distance pair is a coded length followed by a
- *   coded distance to represent a string that occurs earlier in the
- *   uncompressed data that occurs again at the current location.
- *
- * - Literals, lengths, and the end-of-block code are combined into a single
- *   code of up to 286 symbols.  They are 256 literals (0..255), 29 length
- *   symbols (257..285), and the end-of-block symbol (256).
- *
- * - There are 256 possible lengths (3..258), and so 29 symbols are not enough
- *   to represent all of those.  Lengths 3..10 and 258 are in fact represented
- *   by just a length symbol.  Lengths 11..257 are represented as a symbol and
- *   some number of extra bits that are added as an integer to the base length
- *   of the length symbol.  The number of extra bits is determined by the base
- *   length symbol.  These are in the static arrays below, lens[] for the base
- *   lengths and lext[] for the corresponding number of extra bits.
- *
- * - The reason that 258 gets its own symbol is that the longest length is used
- *   often in highly redundant files.  Note that 258 can also be coded as the
- *   base value 227 plus the maximum extra value of 31.  While a good deflate
- *   should never do this, it is not an error, and should be decoded properly.
- *
- * - If a length is decoded, including its extra bits if any, then it is
- *   followed a distance code.  There are up to 30 distance symbols.  Again
- *   there are many more possible distances (1..32768), so extra bits are added
- *   to a base value represented by the symbol.  The distances 1..4 get their
- *   own symbol, but the rest require extra bits.  The base distances and
- *   corresponding number of extra bits are below in the static arrays dist[]
- *   and dext[].
- *
- * - Literal bytes are simply written to the output.  A length/distance pair is
- *   an instruction to copy previously uncompressed bytes to the output.  The
- *   copy is from distance bytes back in the output stream, copying for length
- *   bytes.
- *
- * - Distances pointing before the beginning of the output data are not
- *   permitted.
- *
- * - Overlapped copies, where the length is greater than the distance, are
- *   allowed and common.  For example, a distance of one and a length of 258
- *   simply copies the last byte 258 times.  A distance of four and a length of
- *   twelve copies the last four bytes three times.  A simple forward copy
- *   ignoring whether the length is greater than the distance or not implements
- *   this correctly.  You should not use memcpy() since its behavior is not
- *   defined for overlapped arrays.  You should not use memmove() or bcopy()
- *   since though their behavior -is- defined for overlapping arrays, it is
- *   defined to do the wrong thing in this case.
- */
-
-/// permutation of code length codes
-static const __device__ __constant__ uint16_t
-    g_lens[29] = { // Size base for length codes 257..285
-        3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
-        31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
-static const __device__ __constant__ uint16_t
-    g_lext[29] = { // Extra bits for length codes 257..285
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
-        2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
-
-static const __device__ __constant__ uint16_t
-    g_dists[30] = { // Offset base for distance codes 0..29
-        1,    2,    3,    4,    5,    7,    9,    13,    17,    25,
-        33,   49,   65,   97,   129,  193,  257,  385,   513,   769,
-        1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
-static const __device__ __constant__ uint16_t
-    g_dext[30] = { // Extra bits for distance codes 0..29
-        0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
-        6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
-
-/// @brief Thread 0 only: decode bitstreams and output symbols into the symbol
-/// queue
-__device__ void decode_symbols(inflate_state_s *s) {
-  uint32_t bitpos = s->bitpos;
-  uint2 bitbuf = s->bitbuf;
-  auto cur = s->cur;
-  auto end = s->end;
-  int32_t batch = 0;
-  int32_t sym, batch_len;
-
-  do {
-    volatile uint32_t *b = &s->x.u.symqueue[batch * batch_size];
-    // Wait for the next batch entry to be empty
-#if ENABLE_PREFETCH
-    // Wait for prefetcher to fetch a worst-case of 48 bits per symbol
-    while ((*(volatile int32_t *)&s->pref.cur_p - (int32_t)(size_t)cur <
-            batch_size * 6) ||
-           (s->x.batch_len[batch] != 0)) {
-    }
-#else
-    while (s->x.batch_len[batch] != 0) {
-    }
-#endif
-    batch_len = 0;
-#if ENABLE_PREFETCH
-    if (cur + (bitpos >> 3) >= end) {
-      s->err = 1;
-      break;
-    }
-#endif
-    // Inner loop decoding symbols
-    do {
-      uint32_t next32 =
-          __funnelshift_rc(bitbuf.x, bitbuf.y, bitpos); // nextbits32(s);
-      uint32_t len;
-      sym = s->u.lut.lenlut[next32 & ((1 << log2_len_lut) - 1)];
-      if ((uint32_t)sym < (uint32_t)(0x100 << 5)) {
-        // We can lookup a second symbol if this was a short literal
-        len = sym & 0x1f;
-        sym >>= 5;
-        b[batch_len++] = sym;
-        next32 >>= len;
-        bitpos += len;
-        sym = s->u.lut.lenlut[next32 & ((1 << log2_len_lut) - 1)];
-      }
-      if (sym > 0) // short symbol
-      {
-        len = sym & 0x1f;
-        sym = ((sym >> 5) & 0x3ff) +
-              ((next32 >> (sym >> 24)) & ((sym >> 16) & 0x1f));
-      } else {
-        // Slow length path
-        uint32_t next32r = __brev(next32);
-        int16_t const *symbols = &s->lensym[s->index_slow_len];
-        unsigned int first = s->first_slow_len;
-        int lext;
-#pragma unroll 1
-        for (len = log2_len_lut + 1; len <= max_bits; len++) {
-          unsigned int code = (next32r >> (32 - len)) - first;
-          unsigned int count = s->lencnt[len];
-          if (code < count) // if length len, return symbol
-          {
-            sym = symbols[code];
-            break;
-          }
-          symbols += count; // else update for next length
-          first += count;
-          first <<= 1;
-        }
-        if (len > max_bits) {
-          s->err = -10;
-          sym = 256;
-          len = 0;
-        }
-        if (sym > 256) {
-          sym -= 257;
-          lext = g_lext[sym];
-          sym = 256 + g_lens[sym] + bfe(next32, len, lext);
-          len += lext;
-        }
-      }
-      if (sym > 256) {
-        int dist, dext;
-        // skipbits(s, len) inlined - no limit check
-        bitpos += len;
-        if (bitpos >= 32) {
-          bitbuf.x = bitbuf.y;
-#if ENABLE_PREFETCH
-          bitbuf.y = *prefetch_addr32(s->pref, cur + 8);
-          cur += 4;
-#else
-          cur += 8;
-          bitbuf.y = (cur < end) ? *(uint32_t const *)cur : 0;
-          cur -= 4;
-#endif
-          bitpos &= 0x1f;
-        }
-        // get distance
-        next32 = __funnelshift_rc(bitbuf.x, bitbuf.y, bitpos); // nextbits32(s);
-        dist = s->u.lut.distlut[next32 & ((1 << log2_dist_lut) - 1)];
-        if (dist > 0) {
-          len = dist & 0x1f;
-          dext = bfe(dist, 20, 5);
-          dist = bfe(dist, 5, 15);
-          sym |= (dist + bfe(next32, len, dext)) << 16;
-          len += dext;
-        } else {
-          uint32_t next32r = __brev(next32);
-          int16_t const *symbols = &s->distsym[s->index_slow_dist];
-          unsigned int first = s->first_slow_dist;
-#pragma unroll 1
-          for (len = log2_dist_lut + 1; len <= max_bits; len++) {
-            unsigned int code = (next32r >> (32 - len)) - first;
-            unsigned int count = s->distcnt[len];
-            if (code < count) // if length len, return symbol
-            {
-              dist = symbols[code];
-              break;
-            }
-            symbols += count; // else update for next length
-            first += count;
-            first <<= 1;
-          }
-          if (len > max_bits) {
-            s->err = -10;
-            sym = 256;
-            len = 0;
-          } else {
-            dext = g_dext[dist];
-            sym |= (g_dists[dist] + bfe(next32, len, dext)) << 16;
-            len += dext;
-          }
-        }
-      }
-      // skipbits(s, len) inlined with added error check for reading past the
-      // end of the input buffer
-      bitpos += len;
-      if (bitpos >= 32) {
-        bitbuf.x = bitbuf.y;
-#if ENABLE_PREFETCH
-        bitbuf.y = *prefetch_addr32(s->pref, cur + 8);
-        cur += 4;
-#else
-        cur += 8;
-        if (cur < end) {
-          bitbuf.y = *(uint32_t const *)cur;
-          cur -= 4;
-        } else {
-          bitbuf.y = 0;
-          cur -= 4;
-          if (cur > end) {
-            s->err = 1;
-            sym = 256;
-          }
-        }
-#endif
-        bitpos &= 0x1f;
-      }
-      if (sym == 256)
-        break;
-      b[batch_len++] = sym;
-    } while (batch_len < batch_size - 1);
-    s->x.batch_len[batch] = batch_len;
-#if ENABLE_PREFETCH
-    ((volatile inflate_state_s *)s)->cur = cur;
-#endif
-    if (batch_len != 0)
-      batch = (batch + 1) & (batch_count - 1);
-  } while (sym != 256);
-
-  while (s->x.batch_len[batch] != 0) {
-  }
-  s->x.batch_len[batch] = -1;
-  s->bitbuf = bitbuf;
-  s->bitpos = bitpos;
-#if !ENABLE_PREFETCH
-  s->cur = cur;
-#endif
-}
-
-/**
- * @brief Build lookup tables for faster decode
- * LUT format is symbols*16+length
- */
-__device__ void init_length_lut(inflate_state_s *s, int t) {
-  int32_t *lut = s->u.lut.lenlut;
-
-  for (uint32_t bits = t; bits < (1 << log2_len_lut); bits += blockDim.x) {
-    int16_t const *cnt = s->lencnt;
-    int16_t const *symbols = s->lensym;
-    int sym =
-        -320; // TODO(HIP/AMD): -10 << 5; the original left shift is not
-              // accepted by hipclang as it is undefined (see
-              // https://en.cppreference.com/w/cpp/language/operator_arithmetic)
-    unsigned int first = 0;
-    unsigned int rbits = __brev(bits) >> (32 - log2_len_lut);
-    for (unsigned int len = 1; len <= log2_len_lut; len++) {
-      unsigned int code = (rbits >> (log2_len_lut - len)) - first;
-      unsigned int count = cnt[len];
-      if (code < count) {
-        sym = symbols[code];
-        if (sym > 256) {
-          int lext = g_lext[sym - 257];
-          sym = (256 + g_lens[sym - 257]) | (((1 << lext) - 1) << (16 - 5)) |
-                (len << (24 - 5));
-          len += lext;
-        }
-        sym = (sym << 5) | len;
-        break;
-      }
-      symbols += count; // else update for next length
-      first += count;
-      first <<= 1;
-    }
-    lut[bits] = sym;
-  }
-  if (!t) {
-    unsigned int first = 0;
-    unsigned int index = 0;
-    int16_t const *cnt = s->lencnt;
-    for (unsigned int len = 1; len <= log2_len_lut; len++) {
-      unsigned int count = cnt[len];
-      index += count;
-      first += count;
-      first <<= 1;
-    }
-    s->first_slow_len = first;
-    s->index_slow_len = index;
-  }
-}
-
-/**
- * @brief Build lookup tables for faster decode of distance symbol
- * LUT format is symbols*16+length
- */
-__device__ void init_distance_lut(inflate_state_s *s, int t) {
-  int32_t *lut = s->u.lut.distlut;
-
-  for (uint32_t bits = t; bits < (1 << log2_dist_lut); bits += blockDim.x) {
-    int16_t const *cnt = s->distcnt;
-    int16_t const *symbols = s->distsym;
-    int sym = 0;
-    unsigned int first = 0;
-    unsigned int rbits = __brev(bits) >> (32 - log2_dist_lut);
-    for (unsigned int len = 1; len <= log2_dist_lut; len++) {
-      unsigned int code = (rbits >> (log2_dist_lut - len)) - first;
-      unsigned int count = cnt[len];
-      if (code < count) {
-        int dist = symbols[code];
-        int dext = g_dext[dist];
-        sym = g_dists[dist] | (dext << 15);
-        sym = (sym << 5) | len;
-        break;
-      }
-      symbols += count; // else update for next length
-      first += count;
-      first <<= 1;
-    }
-    lut[bits] = sym;
-  }
-  if (!t) {
-    unsigned int first = 0;
-    unsigned int index = 0;
-    int16_t const *cnt = s->distcnt;
-    for (unsigned int len = 1; len <= log2_dist_lut; len++) {
-      unsigned int count = cnt[len];
-      index += count;
-      first += count;
-      first <<= 1;
-    }
-    s->first_slow_dist = first;
-    s->index_slow_dist = index;
-  }
-}
-
-/// @brief WARP1: process symbols and output uncompressed stream
-__device__ void process_symbols(inflate_state_s *s, int t) {
-  uint8_t *out = s->out;
-  uint8_t const *outend = s->outend;
-  uint8_t const *outbase = s->outbase;
-  int batch = 0;
-
-  do {
-    volatile uint32_t *b = &s->x.u.symqueue[batch * batch_size];
-    int batch_len = 0;
-    if (t == 0) {
-      while ((batch_len = s->x.batch_len[batch]) == 0) {
-      }
-    }
-    batch_len = SHFL10(batch_len);
-    if (batch_len < 0) {
-      break;
-    }
-
-    auto const symt = (t < batch_len) ? b[t] : 256;
-    auto const lit_mask = BALLOT1(symt >= 256);
-    auto pos = static_cast<uint8_t>(min(
-        (find_first_set_bit(lit_mask) - 1) & 0xff,
-        warpSize)); // TODO(HIP/AMD): static_cast safe here (WAR for compiler
-                    // error)?, also: check mask, warp size and __ffs invocation
-
-    if (t == 0) {
-      s->x.batch_len[batch] = 0;
-    }
-
-    if (t < pos && out + t < outend) {
-      out[t] = symt;
-    }
-    out += pos;
-    batch_len -= pos;
-    while (batch_len > 0) {
-      int dist, len, symbol;
-
-      // Process a non-literal symbol
-      symbol = SHFL1(symt, pos);
-      len = max((symbol & 0xffff) - 256,
-                0); // max should be unnecessary, but just in case
-      dist = symbol >> 16;
-      for (int i = t; i < len; i += 32) {
-        uint8_t const *src = out + ((i >= dist) ? (i % dist) : i) - dist;
-        if (out + i < outend and src >= outbase) {
-          out[i] = *src;
-        }
-      }
-      out += len;
-      pos++;
-      batch_len--;
-      // Process subsequent literals, if any
-      if (!((lit_mask >> pos) & 1)) {
-        len = min((find_first_set_bit(lit_mask >> pos) - 1) & 0xff, batch_len);
-        symbol = SHFL1(symt, (pos + t) & (warpSize - 1));
-        if (t < len && out + t < outend) {
-          out[t] = symbol;
-        }
-        out += len;
-        pos += len;
-        batch_len -= len;
-      }
-    }
-    batch = (batch + 1) & (batch_count - 1);
-  } while (true);
-
-  if (t == 0) {
-    s->out = out;
-  }
-}
-
-/**
- * @brief Initializes a stored block.
- *
- * Format notes:
- *
- * - After the two-bit stored block type (00), the stored block length and
- *   stored bytes are byte-aligned for fast copying.  Therefore any leftover
- *   bits in the byte that has the last bit of the type, as many as seven, are
- *   discarded.  The value of the discarded bits are not defined and should not
- *   be checked against any expectation.
- *
- * - The second inverted copy of the stored block length does not have to be
- *   checked, but it's probably a good idea to do so anyway.
- *
- * - A stored block can have zero length.  This is sometimes used to byte-align
- *   subsets of the compressed data for random access or partial recovery.
- */
-__device__ int init_stored(inflate_state_s *s) {
-  uint32_t len, nlen; // length of stored block
-
-  // Byte align
-  if (s->bitpos & 7) {
-    skipbits(s, 8 - (s->bitpos & 7));
-  }
-  if (s->cur + (s->bitpos >> 3) >= s->end) {
-    return 2; // Not enough input
-  }
-  // get length and check against its one's complement
-  len = getbits(s, 16);
-  nlen = getbits(s, 16);
-  if (len != (nlen ^ 0xffff)) {
-    return -2; // didn't match complement!
-  }
-  if (s->cur + (s->bitpos >> 3) + len > s->end) {
-    return 2; // Not enough input
-  }
-  s->stored_blk_len = len;
-
-  // done with a valid stored block
-  return 0;
-}
-
-/// Copy bytes from stored block to destination
-__device__ void copy_stored(inflate_state_s *s, int t) {
-  auto len = s->stored_blk_len;
-  auto cur = s->cur + s->bitpos / 8;
-  auto out = s->out;
-  auto outend = s->outend;
-  auto const slow_bytes =
-      static_cast<uint8_t>(min(len,
-                               (int)((16 - reinterpret_cast<size_t>(out)) %
-                                     16))); // TODO(HIP/AMD): static_cast safe
-                                            // here (WAR for compiler error)?
-
-  // Slow copy until output is 16B aligned
-  if (slow_bytes) {
-    for (int i = t; i < slow_bytes; i += blockDim.x) {
-      if (out + i < outend) {
-        out[i] =
-            cur[i]; // Input range has already been validated in init_stored()
-      }
-    }
-    cur += slow_bytes;
-    out += slow_bytes;
-    len -= slow_bytes;
-  }
-  auto fast_bytes = len;
-  if (out < outend) {
-    fast_bytes = (int)min((size_t)fast_bytes, (outend - out));
-  }
-  fast_bytes &= ~0xf;
-  auto bitpos = ((int)((size_t)cur % 4)) * 8;
-  auto cur4 = cur - (bitpos / 8);
-  if (out < outend) {
-    // Fast copy 16 bytes at a time
-    for (int i = t * 16; i < fast_bytes; i += blockDim.x * 16) {
-      uint4 u;
-      u.x = *reinterpret_cast<uint32_t const *>(cur4 + i + 0 * 4);
-      u.y = *reinterpret_cast<uint32_t const *>(cur4 + i + 1 * 4);
-      u.z = *reinterpret_cast<uint32_t const *>(cur4 + i + 2 * 4);
-      u.w = *reinterpret_cast<uint32_t const *>(cur4 + i + 3 * 4);
-      if (bitpos != 0) {
-        uint32_t v = (bitpos != 0)
-                         ? *reinterpret_cast<uint32_t const *>(cur4 + i + 4 * 4)
-                         : 0;
-        u.x = __funnelshift_rc(u.x, u.y, bitpos);
-        u.y = __funnelshift_rc(u.y, u.z, bitpos);
-        u.z = __funnelshift_rc(u.z, u.w, bitpos);
-        u.w = __funnelshift_rc(u.w, v, bitpos);
-      }
-      *reinterpret_cast<uint4 *>(out + i) = u;
-    }
-  }
-  cur += fast_bytes;
-  out += fast_bytes;
-  len -= fast_bytes;
-  // Slow copy for remaining bytes
-  for (int i = t; i < len; i += blockDim.x) {
-    if (out + i < outend) {
-      out[i] =
-          cur[i]; // Input range has already been validated in init_stored()
-    }
-  }
-  out += len;
-  __syncthreads();
-  if (t == 0) {
-    // Reset bitstream to end of block
-    auto p = cur + len;
-    auto prefix_bytes = (uint32_t)(((size_t)p) & 3);
-    p -= prefix_bytes;
-    s->cur = p;
-    s->bitbuf.x = (p < s->end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
-    p += 4;
-    s->bitbuf.y = (p < s->end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
-    s->bitpos = prefix_bytes * 8;
-    s->out = out;
-  }
-}
-
-#if ENABLE_PREFETCH
-__device__ void init_prefetcher(inflate_state_s *s, int t) {
-  if (t == 0) {
-    s->pref.cur_p = s->cur;
-    s->pref.run = 1;
-  }
-}
-
-__device__ void prefetch_warp(volatile inflate_state_s *s, int t) {
-  uint8_t const *cur_p = s->pref.cur_p;
-  uint8_t const *end = s->end;
-  while (SHFL10((t == 0) ? s->pref.run : 0)) {
-    auto cur_lo = (int32_t)(size_t)cur_p;
-    int do_pref = SHFL10((t == 0) ? (cur_lo - *(volatile int32_t *)&s->cur <
-                                     prefetch_size - warpSize * 4 - 4)
-                                  : 0);
-    if (do_pref) {
-      uint8_t const *p = cur_p + 4 * t;
-      *prefetch_addr32(s->pref, p) =
-          (p < end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
-      cur_p += 4 * warpSize;
-      __threadfence_block();
-      SYNCWARP();
-      if (!t) {
-        s->pref.cur_p = cur_p;
-        __threadfence_block();
-      }
-    }
-  }
-}
-#endif // ENABLE_PREFETCH
 
 /**
  * @brief Parse GZIP header
@@ -1110,6 +139,205 @@ __device__ int parse_gzip_header(uint8_t const *src, size_t src_size) {
 }
 
 /**
+ * Deflate/GZIP compressor.
+ *
+ * \tparam PREFETCH_SIZE Number of bytes to prefetch, only use if temmplate
+ *                          parameter \code ENABLE_PREFETCH \endcode is set to
+ *                          \code true \endcode, can be set to anything (0)
+ * otherwise.
+ * \tparam ENABLE_PREFETCH Enable the use of a specialized prefetch warp.
+ */
+template <int warpsize, int BATCH_SIZE, int BATCH_COUNT, int PREFETCH_SIZE,
+          bool ENABLE_PREFETCH>
+class Decompressor {
+private:
+  using INFLATE_STATE_S =
+      inflate_state_s<BATCH_SIZE, BATCH_COUNT, PREFETCH_SIZE>;
+
+  template <typename DECODER, typename PREFETCHER, typename PROCESSOR>
+  static __device__ inline void
+  decompress(const uint8_t *const __restrict__ device_in_ptr, // ptr
+             const uint64_t device_in_bytes,
+             uint8_t *const __restrict__ device_out_ptr,
+             const uint64_t device_out_available_bytes,
+             hipcompStatus_t *const __restrict__ status,    // &scalar
+             uint64_t *const __restrict__ device_out_bytes, // &scalar
+             uint32_t *const __restrict__ device_reserved,  // &scalar
+             bool parse_hdr) {
+    __shared__ __align__(16) INFLATE_STATE_S state_g;
+
+    int t = threadIdx.x;
+    //: - int z                  = blockIdx.x;
+    INFLATE_STATE_S *state = &state_g;
+
+    if (!t) {
+      //:- auto p        = inputs[z].data();
+      //:- auto src_size = inputs[z].size();
+      auto p = device_in_ptr;
+      auto src_size = device_in_bytes;
+      // Parse header if needed
+      state->err = 0;
+      if (parse_hdr) {
+        int hdr_len = parse_gzip_header(p, src_size);
+        src_size = (src_size >= 8) ? src_size - 8 : 0; // ignore footer
+        if (hdr_len >= 0) {
+          p += hdr_len;
+          src_size -= hdr_len;
+        } else {
+          state->err = hdr_len;
+        }
+      }
+      // Initialize shared state
+      //:- state->out              = outputs[z].data();
+      state->out = device_out_ptr;
+      state->outbase = state->out;
+      //:- state->outend           = state->out + outputs[z].size();
+      state->outend = state->out + device_out_available_bytes;
+      state->end = p + src_size;
+      auto const prefix_bytes = (uint32_t)(((size_t)p) & 3);
+      p -= prefix_bytes;
+      state->cur = p;
+      state->bitbuf.x =
+          (p < state->end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
+      p += 4;
+      state->bitbuf.y =
+          (p < state->end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
+      state->bitpos = prefix_bytes * 8;
+    }
+    __syncthreads();
+    // Main loop decoding blocks
+    while (!state->err) {
+      if (!t) {
+        // Thread0: read last flag, block type and custom huffman tables if any
+        if (state->cur + (state->bitpos >> 3) >= state->end)
+          state->err = 2;
+        else {
+          state->blast = state->getbits(1);
+          state->btype = state->getbits(2);
+          if (state->btype == 0)
+            state->err = state->init_stored();
+          else if (state->btype == 1)
+            state->err = state->init_fixed();
+          else if (state->btype == 2)
+            state->err = state->init_dynamic();
+          else
+            state->err = -1; // Invalid block
+        }
+      }
+      __syncthreads();
+      if (!state->err && (state->btype == 1 || state->btype == 2)) {
+        // Initializes lookup tables (block wide)
+        state->init_length_lut(t);
+        state->init_distance_lut(t);
+        if constexpr (ENABLE_PREFETCH) {
+          // Initialize prefetcher
+          state->init_prefetcher(t);
+        }
+        if (t < BATCH_COUNT) {
+          state->x.batch_len[t] = 0;
+        }
+        __syncthreads();
+        // decode data until end-of-block code
+        if (t < 1 * warpsize) {
+          // WARP0: decode variable-length symbols
+          DECODER::apply(state, t);
+          if (!t) {
+            if constexpr (ENABLE_PREFETCH) {
+              state->pref.run = 0;
+            }
+          }
+        } else if (t < 2 * warpsize) {
+          // WARP1: perform LZ77 using length and distance codes from WARP0
+          PROCESSOR::apply(state, t & (warpsize - 1));
+        } else if (t < 3 * warpsize) {
+          if constexpr (ENABLE_PREFETCH) {
+            // WARP2: Prefetcher: prefetch data for WARP0
+            PREFETCHER::apply(state, t & (warpsize - 1));
+          }
+        }
+        // else WARP3: idle
+      } else if (!state->err && state->btype == 0) {
+        // Uncompressed block (block-wide memcpy)
+        state->copy_stored(t);
+      }
+      if (state->blast)
+        break;
+      __syncthreads();
+    }
+    __syncthreads();
+    // Output decompression status and length
+    if (!t) {
+      if (state->err == 0 &&
+          state->cur + ((state->bitpos + 7) >> 3) > state->end) {
+        // Read past the end of the input buffer
+        state->err = 2;
+      } else if (state->err == 0 && state->out > state->outend) {
+        // Output buffer too small
+        state->err = 1;
+      }
+      //:- results[z].bytes_written = state->out - state->outbase;
+      //:- results[z].status        = [&]() {
+      //:- switch (state->err) {
+      //:-   case 0: return compression_status::SUCCESS;
+      //:-   case 1: return compression_status::OUTPUT_OVERFLOW;
+      //:-   default: return compression_status::FAILURE;
+      //:- }
+      //:- }();
+      //:- results[z].reserved = (int)(state->end - state->cur);  // Here mainly
+      //: for debug purposes
+      if (device_out_bytes) {
+        *device_out_bytes = state->out - state->outbase;
+      }
+      if (status) {
+        *status = [&]() {
+          switch (state->err) {
+          case 0:
+            return hipcompSuccess;
+          case 1:
+            return hipcompErrorOutOfMemory;
+          default:
+            return hipcompErrorCannotDecompress;
+          }
+        }();
+      }
+      if (device_reserved) {
+        *device_reserved =
+            (int)(state->end - state->cur); // Here mainly for debug purposes
+      }
+    }
+  }
+
+public:
+  // TODO(HIP/AMD): Double-check meaning of launch_bounds HIP vs CUDA
+  // TODO(HIP/AMD): we have 3 (2 without prefetcher) specialized warps, why 4
+  // warps per block?
+  // TODO(HIP/AMD): make this constexpr w
+  static constexpr int DECOMP_WARPS_PER_BLOCK = 4;
+
+  static __device__ inline void
+  apply(const uint8_t *const __restrict__ device_in_ptr, // ptr
+        const uint64_t device_in_bytes,
+        uint8_t *const __restrict__ device_out_ptr,
+        const uint64_t device_out_available_bytes,
+        hipcompStatus_t *const __restrict__ status,    // &scalar
+        uint64_t *const __restrict__ device_out_bytes, // &scalar
+        uint32_t *const __restrict__ device_reserved,  // &scalar
+        bool parse_hdr) {
+    decompress<
+        DecodeSymbolsSingleThreaded<warpsize, INFLATE_STATE_S, ENABLE_PREFETCH>,
+        PrefetchByteStream<warpsize, INFLATE_STATE_S>,
+        ProcessSymbols<warpsize,
+                       INFLATE_STATE_S>>(device_in_ptr, // ptr
+                                         device_in_bytes, device_out_ptr,
+                                         device_out_available_bytes,
+                                         status,           // &scalar
+                                         device_out_bytes, // &scalar
+                                         device_reserved,  // &scalar
+                                         parse_hdr);
+  }
+};
+
+/**
  * \brief Per-chunk (=single block) operation of INFLATE ("DEFLATE
  * decompression").
  *
@@ -1135,6 +363,32 @@ __device__ int parse_gzip_header(uint8_t const *src, size_t src_size) {
  * @param[in] parse_hdr If ``true``, indicates that the compressed bitstream
  * includes a GZIP header
  */
+template <int warpsize, int BATCH_SIZE, int BATCH_COUNT, int PREFETCH_SIZE,
+          bool ENABLE_PREFETCH = true>
+__device__ void
+do_inflate2(const uint8_t *const __restrict__ device_in_ptr, // ptr
+            const uint64_t device_in_bytes,
+            uint8_t *const __restrict__ device_out_ptr,
+            const uint64_t device_out_available_bytes,
+            hipcompStatus_t *const __restrict__ status,    // &scalar
+            uint64_t *const __restrict__ device_out_bytes, // &scalar
+            uint32_t *const __restrict__ device_reserved,  // &scalar
+            bool parse_hdr) {
+  Decompressor<warpsize, BATCH_SIZE, BATCH_COUNT, PREFETCH_SIZE,
+               ENABLE_PREFETCH>::apply(device_in_ptr, // ptr
+                                       device_in_bytes, device_out_ptr,
+                                       device_out_available_bytes,
+                                       status,           // &scalar
+                                       device_out_bytes, // &scalar
+                                       device_reserved,  // &scalar
+                                       parse_hdr);
+}
+
+/**
+ * \note This variant of "do_inflate" pre-defines some of the template
+ *       parmeters of `do_inflate2`.
+ */
+template <int warpsize>
 __device__ void
 do_inflate(const uint8_t *const __restrict__ device_in_ptr, // ptr
            const uint64_t device_in_bytes,
@@ -1144,152 +398,41 @@ do_inflate(const uint8_t *const __restrict__ device_in_ptr, // ptr
            uint64_t *const __restrict__ device_out_bytes, // &scalar
            uint32_t *const __restrict__ device_reserved,  // &scalar
            bool parse_hdr) {
-  __shared__ __align__(16) inflate_state_s state_g;
+  // TODO(HIP/AMD): Fine-tune these parameters.
+  // We need a prefetch size of >=2^10 = 1024 bytes here.
+  // At batch_size = 2^6 = 64 for HIP AMD backend, wavefront 0
+  // requires the prefetcher (wavefront 2) to have prefetched at least 64 * 6 =
+  // 384 bytes before proceeding with process_symbols(). However, with
+  // prefetch_size<=2^9 = 512 bytes, the prefetcher would only fetch 256 bytes
+  // (some space is left on purpose in the buffer), which would cause some unit
+  // tests to hang.
+  constexpr int log2_prefetch_size =
+      (warpsize == 64) ? 10 : 9; // Must be at least LOG2_BATCH_SIZE+3
+  constexpr int prefetch_size = (1 << log2_prefetch_size);
 
-  int t = threadIdx.x;
-  //: - int z                  = blockIdx.x;
-  inflate_state_s *state = &state_g;
+  constexpr int log2_batch_size = (warpsize == 64) ? 6 : 5;
+  constexpr int batch_size = (1 << log2_batch_size);
 
-  if (!t) {
-    //:- auto p        = inputs[z].data();
-    //:- auto src_size = inputs[z].size();
-    auto p = device_in_ptr;
-    auto src_size = device_in_bytes;
-    // Parse header if needed
-    state->err = 0;
-    if (parse_hdr) {
-      int hdr_len = parse_gzip_header(p, src_size);
-      src_size = (src_size >= 8) ? src_size - 8 : 0; // ignore footer
-      if (hdr_len >= 0) {
-        p += hdr_len;
-        src_size -= hdr_len;
-      } else {
-        state->err = hdr_len;
-      }
-    }
-    // Initialize shared state
-    //:- state->out              = outputs[z].data();
-    state->out = device_out_ptr;
-    state->outbase = state->out;
-    //:- state->outend           = state->out + outputs[z].size();
-    state->outend = state->out + device_out_available_bytes;
-    state->end = p + src_size;
-    auto const prefix_bytes = (uint32_t)(((size_t)p) & 3);
-    p -= prefix_bytes;
-    state->cur = p;
-    state->bitbuf.x =
-        (p < state->end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
-    p += 4;
-    state->bitbuf.y =
-        (p < state->end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
-    state->bitpos = prefix_bytes * 8;
-  }
-  __syncthreads();
-  // Main loop decoding blocks
-  while (!state->err) {
-    if (!t) {
-      // Thread0: read last flag, block type and custom huffman tables if any
-      if (state->cur + (state->bitpos >> 3) >= state->end)
-        state->err = 2;
-      else {
-        state->blast = getbits(state, 1);
-        state->btype = getbits(state, 2);
-        if (state->btype == 0)
-          state->err = init_stored(state);
-        else if (state->btype == 1)
-          state->err = init_fixed(state);
-        else if (state->btype == 2)
-          state->err = init_dynamic(state);
-        else
-          state->err = -1; // Invalid block
-      }
-    }
-    __syncthreads();
-    if (!state->err && (state->btype == 1 || state->btype == 2)) {
-      // Initializes lookup tables (block wide)
-      init_length_lut(state, t);
-      init_distance_lut(state, t);
-#if ENABLE_PREFETCH
-      // Initialize prefetcher
-      init_prefetcher(state, t);
-#endif
-      if (t < batch_count) {
-        state->x.batch_len[t] = 0;
-      }
-      __syncthreads();
-      // decode data until end-of-block code
-      if (t < 1 * warpSize) {
-        // WARP0: decode variable-length symbols
-        if (!t) {
-          // Thread0: decode symbols (single threaded)
-          decode_symbols(state);
-#if ENABLE_PREFETCH
-          state->pref.run = 0;
-#endif
-        }
-      } else if (t < 2 * warpSize) {
-        // WARP1: perform LZ77 using length and distance codes from WARP0
-        process_symbols(state, t & (warpSize - 1));
-      }
-#if ENABLE_PREFETCH
-      else if (t < 3 * warpSize) {
-        // WARP2: Prefetcher: prefetch data for WARP0
-        prefetch_warp(state, t & (warpSize - 1));
-      }
-#endif
-      // else WARP3: idle
-    } else if (!state->err && state->btype == 0) {
-      // Uncompressed block (block-wide memcpy)
-      copy_stored(state, t);
-    }
-    if (state->blast)
-      break;
-    __syncthreads();
-  }
-  __syncthreads();
-  // Output decompression status and length
-  if (!t) {
-    if (state->err == 0 &&
-        state->cur + ((state->bitpos + 7) >> 3) > state->end) {
-      // Read past the end of the input buffer
-      state->err = 2;
-    } else if (state->err == 0 && state->out > state->outend) {
-      // Output buffer too small
-      state->err = 1;
-    }
-    //:- results[z].bytes_written = state->out - state->outbase;
-    //:- results[z].status        = [&]() {
-    //:- switch (state->err) {
-    //:-   case 0: return compression_status::SUCCESS;
-    //:-   case 1: return compression_status::OUTPUT_OVERFLOW;
-    //:-   default: return compression_status::FAILURE;
-    //:- }
-    //:- }();
-    //:- results[z].reserved = (int)(state->end - state->cur);  // Here mainly
-    //: for debug purposes
-    if (device_out_bytes) {
-      *device_out_bytes = state->out - state->outbase;
-    }
-    if (status) {
-      *status = [&]() {
-        switch (state->err) {
-        case 0:
-          return hipcompSuccess;
-        case 1:
-          return hipcompErrorOutOfMemory;
-        default:
-          return hipcompErrorCannotDecompress;
-        }
-      }();
-    }
-    if (device_reserved) {
-      *device_reserved =
-          (int)(state->end - state->cur); // Here mainly for debug purposes
-    }
-  }
+  /// 4 batches of 32 symbols
+  constexpr int log2_batch_count = 2; // 1..5
+  constexpr int batch_count = (1 << log2_batch_count);
+
+  constexpr bool enable_prefetch = true;
+
+  do_inflate2<warpsize, batch_size, batch_count, prefetch_size,
+              enable_prefetch>(device_in_ptr, // ptr
+                               device_in_bytes, device_out_ptr,
+                               device_out_available_bytes,
+                               status,           // &scalar
+                               device_out_bytes, // &scalar
+                               device_reserved,  // &scalar
+                               parse_hdr);
 }
 
-} // namespace gzip
+constexpr int DECOMP_WARPS_PER_BLOCK =
+    Decompressor<0, 0, 0, 0, true>::DECOMP_WARPS_PER_BLOCK;
+
+} // namespace deflate
 } // namespace hipcomp
 
 // NOTE: functions in `deflate/helpers.hiph` currently unused

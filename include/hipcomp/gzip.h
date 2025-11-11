@@ -28,7 +28,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -49,8 +49,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifndef HIPCOMP_GZIP_H
-#define HIPCOMP_GZIP_H
+#pragma once
 
 #include "hipcomp.h"
 
@@ -64,6 +63,23 @@ extern "C" {
 /******************************************************************************
  * Batched decompression interface for gzip
  *****************************************************************************/
+
+struct hipcompBatchedGzipCompressOpts_t {
+  char reserved[64];
+};
+
+struct hipcompBatchedGzipDecompressOpts_t {
+  // not supported (4 byte enum): ...
+  // not supported (4 byte enum): ...
+  // not supported: int ...
+  char reserved[64];
+};
+
+/**
+ * Minimum alignment requirement for HIP memory buffers (input, output,
+ * temporary space) when used with compression/decompression functions.
+ */
+const size_t hipcompGzipRequiredAlignment = 1; // TODO(HIP/AMD): confirm
 
 /**
  * @brief Get the amount of temp space required on the GPU for decompression.
@@ -209,5 +225,3 @@ hipcompStatus_t hipcompBatchedGzipGetDecompressSizeAsync(
 #ifdef __cplusplus
 }
 #endif
-
-#endif // HIPCOMP_GZIP_H

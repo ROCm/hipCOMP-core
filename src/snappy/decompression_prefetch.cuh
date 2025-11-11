@@ -54,7 +54,6 @@ template <int warpsize, typename UNSNAP_STATE_S, int PREFETCH_SECTORS,
           size_t PREFETCH_SLEEP_NS>
 class PrefetchByteStream {
 private:
-  using MaskT = typename Mask<warpsize>::type;
   static constexpr int BATCH_SIZE = UNSNAP_STATE_S::BATCH_SIZE;
   static constexpr int PREFETCH_SIZE = UNSNAP_STATE_S::PREFETCH_SIZE;
 

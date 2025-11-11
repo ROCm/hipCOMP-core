@@ -28,7 +28,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -68,7 +68,8 @@ namespace hipcomp {
  * \note The estimate we use is from cuDF:
  * https://github.com/rapidsai/cudf/blob/f592e9c4bfcc2d8e887ad5f96e5167ee0ee2c73a/cpp/src/io/avro/reader_impl.cu#L207
  */
-__global__ void get_uncompressed_sizes_estimate_kernel(
+// NOTE: Only a single thread is used by this kernel.
+__global__ void __launch_bounds__(1) get_uncompressed_sizes_estimate_kernel(
     const uint64_t *__restrict__ device_in_bytes,
     uint64_t *__restrict__ device_out_bytes, int num_chunks) {
   int chunk_id = threadIdx.x + blockDim.x * blockIdx.x;
@@ -85,8 +86,11 @@ __global__ void get_uncompressed_sizes_estimate_kernel(
  *
  * @param[in] inputs Source & destination information per block
  * @param[out] outputs Decompression status per block
+ * @param[in] parse_hdr Parse the Gzip header (must be set to true if the inputs
+ *are in Gzip format).
  **/
-__global__ void __launch_bounds__(DECOMP_THREADS_PER_BLOCK)
+template <int warpsize>
+__global__ void __launch_bounds__(deflate::DECOMP_WARPS_PER_BLOCK *warpsize)
     gpu_inflate_kernel(const void *const *__restrict__ device_in_ptr,
                        const uint64_t *__restrict__ device_in_bytes,
                        void *const *__restrict__ device_out_ptr,
@@ -96,7 +100,7 @@ __global__ void __launch_bounds__(DECOMP_THREADS_PER_BLOCK)
                        uint32_t *const __restrict__ device_reserved,
                        bool parse_hdr) {
   const int ix_chunk = blockIdx.x;
-  gzip::do_inflate(
+  deflate::do_inflate<warpsize>(
       reinterpret_cast<const uint8_t *>(device_in_ptr[ix_chunk]),
       device_in_bytes[ix_chunk],
       reinterpret_cast<uint8_t *>(device_out_ptr[ix_chunk]),
@@ -113,14 +117,18 @@ void gpu_inflate(const void *const *device_in_ptr,
                  uint32_t *const device_reserved, int count, bool parse_hdr,
                  hipStream_t stream) {
   uint32_t count32 = (count > 0) ? count : 0;
-  dim3 dim_block(DECOMP_THREADS_PER_BLOCK, 1);
-  dim3 dim_grid(count32,
-                1); // TODO: Check max grid dimensions vs max expected count
 
-  gpu_inflate_kernel<<<dim_grid, dim_block, 0, stream>>>(
-      device_in_ptr, device_in_bytes, device_out_ptr,
-      device_out_available_bytes, outputs, device_out_bytes, device_reserved,
-      parse_hdr);
+  HIPCOMP_EXECUTE_WARPSIZE_DEPENDENT_CODE(
+      -1, constexpr int WS = HIPCOMP_WARPSIZE;
+
+      dim3 dim_block(deflate::DECOMP_WARPS_PER_BLOCK * WS, 1);
+      dim3 dim_grid(count);
+
+      gpu_inflate_kernel<WS><<<dim_grid, dim_block, 0, stream>>>(
+          device_in_ptr, device_in_bytes, device_out_ptr,
+          device_out_available_bytes, outputs, device_out_bytes,
+          device_reserved, parse_hdr);)
+
   HipUtils::check_last_error(
       "Failed to launch Gzip/Deflate decompression HIP kernel gpu_inflate");
 }
@@ -128,7 +136,7 @@ void gpu_inflate(const void *const *device_in_ptr,
 void gpu_get_uncompressed_sizes_estimate(const size_t *device_in_bytes,
                                          size_t *device_out_bytes, int count,
                                          hipStream_t stream) {
-  dim3 dim_block(warpsize, 1); // only a single thread is active in any case
+  dim3 dim_block(1); // NOTE: only single thread active
   dim3 dim_grid(count, 1);
 
   get_uncompressed_sizes_estimate_kernel<<<dim_grid, dim_block, 0, stream>>>(

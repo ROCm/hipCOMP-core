@@ -28,7 +28,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -77,7 +77,7 @@ namespace hipcomp {
 //       const size_t max_comp_chunk_size,
 //       size_t* comp_chunk_size)
 //   {
-//     deflate::do_snap(
+//     deflate::do_deflate(
 //         this_decomp_buffer,
 //         decomp_size,
 //         tmp_output_buffer,
@@ -95,6 +95,7 @@ namespace hipcomp {
 //   }
 // };
 
+template <int warpsize>
 struct deflate_decompress_wrapper : hlif_decompress_wrapper {
 
 private:
@@ -113,11 +114,12 @@ public:
    * buffer size, information that function
    *       ``deflate::do_inflate`` can provide.
    */
+
   __device__ void decompress_chunk(uint8_t *decomp_buffer,
                                    const uint8_t *comp_buffer,
                                    const size_t comp_chunk_size,
                                    const size_t decomp_buffer_size) {
-    deflate::do_inflate(
+    deflate::do_inflate<warpsize>(
         comp_buffer, comp_chunk_size, decomp_buffer, decomp_buffer_size, status,
         nullptr, // device_out_actual_bytes -- unnecessary for HLIF //: why ???
         nullptr, //: device_reserved -- unnecessary for HLIF
@@ -153,12 +155,16 @@ void deflateHlifBatchDecompress(const uint8_t *comp_buffer,
                                 const size_t *comp_chunk_sizes,
                                 const uint32_t max_ctas, hipStream_t stream,
                                 hipcompStatus_t *output_status) {
-  const dim3 grid(max_ctas);
-  const dim3 block(DECOMP_THREADS_PER_BLOCK);
-  HlifDecompressBatchKernel<deflate_decompress_wrapper>
+  HIPCOMP_EXECUTE_WARPSIZE_DEPENDENT_CODE(
+      -1, constexpr int WS = HIPCOMP_WARPSIZE;
+
+      const dim3 grid(max_ctas);
+      const dim3 block(deflate::DECOMP_WARPS_PER_BLOCK * WS);
+
+      HlifDecompressBatchKernel<WS, deflate_decompress_wrapper<WS>>
       <<<grid, block, 0, stream>>>(comp_buffer, decomp_buffer, raw_chunk_size,
                                    ix_chunk, num_chunks, comp_chunk_offsets,
-                                   comp_chunk_sizes, output_status);
+                                   comp_chunk_sizes, output_status);)
 }
 
 // TODO(HIP/AMD: Compression not supported
@@ -178,15 +184,20 @@ void deflateHlifBatchDecompress(const uint8_t *comp_buffer,
 // }
 
 size_t deflateHlifDecompMaxBlockOccupancy(const int device_id) {
-  hipDeviceProp_t device_prop;
-  hipGetDeviceProperties(&device_prop, device_id);
   int num_blocks_per_sm;
   constexpr int shmem_size = 0;
-  hipOccupancyMaxActiveBlocksPerMultiprocessor(
-      &num_blocks_per_sm,
-      HlifDecompressBatchKernel<deflate_decompress_wrapper, 1>,
-      DECOMP_THREADS_PER_BLOCK, shmem_size);
 
+  hipDeviceProp_t device_prop = HipUtils::device_properties(device_id);
+
+  HIPCOMP_EXECUTE_WARPSIZE_DEPENDENT_CODE(
+      device_id, constexpr int WS = HIPCOMP_WARPSIZE; HipUtils::check(
+          hipOccupancyMaxActiveBlocksPerMultiprocessor(
+              &num_blocks_per_sm,
+              HlifDecompressBatchKernel<WS, deflate_decompress_wrapper<WS>, 1>,
+              deflate::DECOMP_WARPS_PER_BLOCK * WS, shmem_size),
+          "failed to to obtain max active blocks per multi-processor for "
+          "device " +
+              std::to_string(device_id));)
   return device_prop.multiProcessorCount * num_blocks_per_sm;
 }
 

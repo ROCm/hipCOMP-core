@@ -28,7 +28,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -49,8 +49,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifndef HIPCOMP_GZIP_H
-#define HIPCOMP_GZIP_H
+#pragma once
 
 #include "hipcomp.h"
 
@@ -65,6 +64,23 @@ extern "C" {
  * Batched decompression interface for gzip
  *****************************************************************************/
 
+struct hipcompBatchedDeflateCompressOpts_t {
+  char reserved[64];
+};
+
+struct hipcompBatchedDeflateDecompressOpts_t {
+  // not supported (4 byte enum): ...
+  // not supported (4 byte enum): ...
+  // not supported: int ...
+  char reserved[64];
+};
+
+/**
+ * Minimum alignment requirement for HIP memory buffers (input, output,
+ * temporary space) when used with compression/decompression functions.
+ */
+const size_t hipcompDeflateRequiredAlignment = 1; // TODO(HIP/AMD): confirm
+
 /**
  * @brief Get the amount of temp space required on the GPU for decompression.
  *
@@ -76,7 +92,7 @@ extern "C" {
  *
  * @return hipcompSuccess if successful, and an error code otherwise.
  */
-hipcompStatus_t hipcompBatchedGzipDecompressGetTempSize(
+hipcompStatus_t hipcompBatchedDeflateDecompressGetTempSize(
     size_t num_chunks, size_t max_uncompressed_chunk_bytes, size_t *temp_bytes);
 
 /**
@@ -106,7 +122,7 @@ hipcompStatus_t hipcompBatchedGzipDecompressGetTempSize(
  *
  * @return hipcompSuccess if successful, and an error code otherwise.
  */
-hipcompStatus_t hipcompBatchedGzipDecompressAsync(
+hipcompStatus_t hipcompBatchedDeflateDecompressAsync(
     const void *const *device_compressed_ptrs,
     const size_t *device_compressed_bytes,
     const size_t *device_uncompressed_bytes,
@@ -131,7 +147,7 @@ hipcompStatus_t hipcompBatchedGzipDecompressAsync(
  *
  * @return hipcompSuccess if successful, and an error code otherwise.
  */
-hipcompStatus_t hipcompBatchedGzipGetDecompressSizeAsync(
+hipcompStatus_t hipcompBatchedDeflateGetDecompressSizeAsync(
     const void *const *device_compressed_ptrs,
     const size_t *device_compressed_bytes, size_t *device_uncompressed_bytes,
     size_t batch_size, hipStream_t stream);
@@ -139,5 +155,3 @@ hipcompStatus_t hipcompBatchedGzipGetDecompressSizeAsync(
 #ifdef __cplusplus
 }
 #endif
-
-#endif // HIPCOMP_GZIP_H

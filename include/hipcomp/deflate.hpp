@@ -30,7 +30,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -51,17 +51,19 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include "gdeflate.h"
+#include "deflate.h"
 #include "hipcompManager.hpp"
-
-#include <memory>
 
 namespace hipcomp {
 
+struct DeflateFormatSpecHeader {
+  // Empty for now
+};
+
 struct DeflateManager : PimplManager {
 
-  DeflateManager(size_t uncomp_chunk_size, int algo,
-                 hipStream_t user_stream = 0, const int device_id = 0);
+  DeflateManager(size_t uncomp_chunk_size, hipStream_t user_stream = 0,
+                 const int device_id = 0);
 
   ~DeflateManager();
 };

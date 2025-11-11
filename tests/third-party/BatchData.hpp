@@ -1,0 +1,188 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// MIT License
+//
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
+// reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#pragma once
+
+// nvcc has a known issue with MSVC debug iterators, leading to a warning
+// hit by thrust::device_vector construction from std::vector below, so this
+// pragma disables the warning.
+// More info at: https://github.com/NVIDIA/thrust/issues/1273
+#ifdef __CUDACC__
+#pragma nv_diag_suppress 20011
+#endif
+
+#include "BatchDataCPU.hpp"
+
+#include <thrust/device_vector.h>
+
+class BatchData {
+public:
+  BatchData(const std::vector<std::vector<char>> &host_data,
+            const size_t chunk_size, const size_t alignment)
+      : m_ptrs(), m_sizes(), m_data(), m_size(0) {
+    m_size = compute_batch_size(host_data, chunk_size);
+
+    const size_t aligned_chunk_size = roundUpTo(chunk_size, alignment);
+    m_data = thrust::device_vector<uint8_t>(aligned_chunk_size * size());
+
+    std::vector<void *> uncompressed_ptrs(size());
+    for (size_t i = 0; i < size(); ++i) {
+      uncompressed_ptrs[i] =
+          static_cast<void *>(data() + aligned_chunk_size * i);
+    }
+
+    m_ptrs = thrust::device_vector<void *>(uncompressed_ptrs);
+    std::vector<size_t> sizes =
+        compute_chunk_sizes(host_data, size(), chunk_size);
+    m_sizes = thrust::device_vector<size_t>(sizes);
+
+    // copy data to GPU
+    size_t offset = 0;
+    for (size_t i = 0; i < host_data.size(); ++i) {
+      CUDA_CHECK(cudaMemcpy(uncompressed_ptrs[offset], host_data[i].data(),
+                            host_data[i].size(), cudaMemcpyHostToDevice));
+
+      const size_t num_chunks =
+          (host_data[i].size() + chunk_size - 1) / chunk_size;
+      offset += num_chunks;
+    }
+  }
+
+  BatchData(const BatchDataCPU &batch_data, const bool copy_data,
+            const size_t alignment)
+      : m_ptrs(), m_sizes(), m_data(), m_size() {
+    m_size = batch_data.size();
+    m_sizes = thrust::device_vector<size_t>(batch_data.sizes(),
+                                            batch_data.sizes() + size());
+
+    size_t data_size = 0;
+    for (size_t i = 0; i < size(); ++i) {
+      data_size += roundUpTo(batch_data.sizes()[i], alignment);
+    }
+    m_data = thrust::device_vector<uint8_t>(data_size);
+
+    size_t offset = 0;
+    std::vector<void *> ptrs(size());
+    for (size_t i = 0; i < size(); ++i) {
+      ptrs[i] = data() + offset;
+      offset += roundUpTo(batch_data.sizes()[i], alignment);
+    }
+    m_ptrs = thrust::device_vector<void *>(ptrs);
+
+    if (copy_data) {
+      const void *const *src = batch_data.ptrs();
+      const size_t *bytes = batch_data.sizes();
+      for (size_t i = 0; i < size(); ++i)
+        CUDA_CHECK(
+            cudaMemcpy(ptrs[i], src[i], bytes[i], cudaMemcpyHostToDevice));
+    }
+  }
+
+  BatchData(const size_t max_output_size, const size_t batch_size,
+            const size_t alignment)
+      : m_ptrs(), m_sizes(), m_data(), m_size(batch_size) {
+    const size_t aligned_max_output_size =
+        roundUpTo(max_output_size, alignment);
+    m_data = thrust::device_vector<uint8_t>(aligned_max_output_size * size());
+
+    std::vector<size_t> sizes(size(), aligned_max_output_size);
+    m_sizes = thrust::device_vector<size_t>(sizes);
+
+    std::vector<void *> ptrs(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      ptrs[i] = data() + aligned_max_output_size * i;
+    }
+    m_ptrs = thrust::device_vector<void *>(ptrs);
+  }
+
+  BatchData(BatchData &&other) = default;
+
+  // disable copying
+  BatchData(const BatchData &other) = delete;
+  BatchData &operator=(const BatchData &other) = delete;
+
+  uint8_t *data() { return m_data.data().get(); }
+  const uint8_t *data() const { return m_data.data().get(); }
+
+  void **ptrs() { return m_ptrs.data().get(); }
+  const void *const *ptrs() const { return m_ptrs.data().get(); }
+
+  size_t *sizes() { return m_sizes.data().get(); }
+  const size_t *sizes() const { return m_sizes.data().get(); }
+
+  size_t size() const { return m_size; }
+
+private:
+  thrust::device_vector<void *> m_ptrs;
+  thrust::device_vector<size_t> m_sizes;
+  thrust::device_vector<uint8_t> m_data;
+  size_t m_size;
+};
+
+inline bool operator==(const BatchDataCPU &lhs, const BatchData &rhs) {
+  size_t batch_size = lhs.size();
+
+  if (lhs.size() != rhs.size())
+    return false;
+
+  std::vector<size_t> rhs_sizes(rhs.size());
+  CUDA_CHECK(cudaMemcpy(rhs_sizes.data(), rhs.sizes(),
+                        rhs.size() * sizeof(size_t), cudaMemcpyDeviceToHost));
+
+  std::vector<void *> rhs_ptrs(rhs.size());
+  CUDA_CHECK(cudaMemcpy(rhs_ptrs.data(), rhs.ptrs(),
+                        rhs.size() * sizeof(void *), cudaMemcpyDeviceToHost));
+
+  for (size_t i = 0; i < batch_size; ++i) {
+    if (lhs.sizes()[i] != rhs_sizes[i])
+      return false;
+
+    const uint8_t *lhs_ptr = reinterpret_cast<const uint8_t *>(lhs.ptrs()[i]);
+    const uint8_t *rhs_ptr = reinterpret_cast<const uint8_t *>(rhs_ptrs[i]);
+    std::vector<uint8_t> rhs_data(rhs_sizes[i]);
+    CUDA_CHECK(cudaMemcpy(rhs_data.data(), rhs_ptr, rhs_sizes[i],
+                          cudaMemcpyDeviceToHost));
+    for (size_t j = 0; j < rhs_sizes[i]; ++j)
+      if (lhs_ptr[j] != rhs_data[j]) {
+        return false;
+      }
+  }
+  return true;
+}

@@ -27,7 +27,7 @@
  */
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -48,8 +48,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#ifndef HIPCOMP_API_HPP
-#define HIPCOMP_API_HPP
+#pragma once
 
 #include "hipcomp.h"
 #include "hipcomp/lz4.h"
@@ -176,5 +175,3 @@ inline void throwExceptionIfError(hipcompStatus_t error,
 }
 
 } // namespace hipcomp
-
-#endif

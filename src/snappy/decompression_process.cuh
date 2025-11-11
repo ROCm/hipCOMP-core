@@ -69,7 +69,6 @@ public:
    *
    * \param[inout] s decompression state
    * \param[ino] t thread id within participating group (lane id)
-   * \todo Currently only works for GROUP_MASK_T == MaskT
    */
   __device__ static inline void apply(UNSNAP_STATE_S *s, int t) {
     const uint8_t *literal_base = s->base;

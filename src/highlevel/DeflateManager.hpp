@@ -28,7 +28,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -84,19 +84,15 @@ public:
   DeflateBatchManager(const DeflateBatchManager &) = delete;
 
   // TODO(HIP/AMD): No compression support
-  // size_t compute_max_compressed_chunk_size() final override
-  // {
-  //   size_t max_comp_chunk_size;
-  //   hipcompBatchedDeflateCompressGetMaxOutputChunkSize(
-  //       get_uncomp_chunk_size(), hipcompBatchedDeflateDefaultOpts,
-  //       &max_comp_chunk_size);
-  //   return max_comp_chunk_size;
-  // }
+  size_t compute_max_compressed_chunk_size() final override {
+    throw std::runtime_error(
+        "not implemented; no compression support for deflate");
+  }
 
-  // uint32_t compute_compression_max_block_occupancy() final override
-  // {
-  //   return deflateHlifCompMaxBlockOccupancy(device_id);
-  // }
+  uint32_t compute_compression_max_block_occupancy() final override {
+    throw std::runtime_error(
+        "not implemented; no compression support for deflate");
+  }
 
   uint32_t compute_decompression_max_block_occupancy() final override {
     return deflateHlifDecompMaxBlockOccupancy(device_id);
@@ -107,13 +103,10 @@ public:
   }
 
   // TODO(HIP/AMD): No compression support
-  // void do_batch_compress(const CompressArgs& compress_args) final override
-  // {
-  //   deflateHlifBatchCompress(
-  //       compress_args,
-  //       get_max_comp_ctas(),
-  //       user_stream);
-  // }
+  void do_batch_compress(const CompressArgs &compress_args) final override {
+    throw std::runtime_error(
+        "not implemented; no compression support for deflate");
+  }
 
   void do_batch_decompress(const uint8_t *comp_data_buffer,
                            uint8_t *decomp_buffer, const uint32_t num_chunks,

@@ -27,7 +27,7 @@
 # ##############################################################################
 # MIT License
 #
-# Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+# Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -84,3 +84,5 @@ foreach(EXAMPLE_SOURCE ${EXAMPLE_SOURCES})
   get_filename_component(BARE_NAME "${EXAMPLE_NAME}" NAME_WE)
   add_test_file(${EXAMPLE_SOURCE} ${EXAMPLE_NAME})
 endforeach(EXAMPLE_SOURCE ${EXAMPLE_SOURCES})
+
+add_subdirectory(third-party)

@@ -224,7 +224,8 @@ This project contains work derived from NVIDIA nvCOMP v2.2 that is licensed unde
 
 ## Files Subject to the Apache 2.0 License
 
-This project contains work derived from NVIDIA nvCOMP v2.2 that is licensed under the Apache 2.0 license:
+This project contains work derived from NVIDIA nvCOMP v2.2 and the
+CUDALibrarySamples that are licensed under the Apache 2.0 license:
 
 * LICENSE TEXT (YEAR differs per file):
 
@@ -250,6 +251,11 @@ This project contains work derived from NVIDIA nvCOMP v2.2 that is licensed unde
   * ``cmake/hipcomp-config.cmake.in``
   * ``src/SnappyBlockUtils.cuh``
   * ``src/SnappyKernels.cu``
+
+* HOMEPAGE: https://github.com/NVIDIA/CUDALibrarySamples
+
+* FILES:
+  * ``deflate_cpu_compression_test.cpp``
 
 ## Files Subject to the Boost Software Lincese, Version 1.0
 

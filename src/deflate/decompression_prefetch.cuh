@@ -45,7 +45,7 @@ Mark Adler    madler@alumni.caltech.edu
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -66,85 +66,52 @@ Mark Adler    madler@alumni.caltech.edu
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include <hipcub/hipcub.hpp>
+#pragma once
 
-// NOTE: Currently unused!
+#include "device_functions.cuh"
+
 namespace hipcomp {
-namespace gzip {
+namespace deflate {
 
 /**
- * @brief Copy a group of buffers
- *
- * blockDim {1024,1,1}
- *
- * @param inputs Source and destination information per block
+ * Prefetch byte stream strategy that needs
+ * to be passed ot the Decompressor class.
  */
-__global__ void __launch_bounds__(1024) copy_uncompressed_kernel(
-    device_span<device_span<uint8_t const> const> inputs,
-    device_span<device_span<uint8_t> const> outputs) {
-  __shared__ uint8_t const *volatile src_g;
-  __shared__ uint8_t *volatile dst_g;
-  __shared__ uint32_t volatile copy_len_g;
+template <int warpsize, typename INFLATE_STATE_S> class PrefetchByteStream {
+private:
+  static constexpr int PREFETCH_SIZE = INFLATE_STATE_S::PREFETCH_SIZE;
 
-  uint32_t t = threadIdx.x;
-  uint32_t z = blockIdx.x;
-  uint8_t const *src;
-  uint8_t *dst;
-  uint32_t len, src_align_bytes, src_align_bits, dst_align_bytes;
-
-  if (!t) {
-    src = inputs[z].data();
-    dst = outputs[z].data();
-    len = static_cast<uint32_t>(min(inputs[z].size(), outputs[z].size()));
-    src_g = src;
-    dst_g = dst;
-    copy_len_g = len;
-  }
-  __syncthreads();
-  src = src_g;
-  dst = dst_g;
-  len = copy_len_g;
-  // Align output to 32-bit
-  dst_align_bytes = 3 & -reinterpret_cast<intptr_t>(dst);
-  if (dst_align_bytes != 0) {
-    uint32_t align_len = min(dst_align_bytes, len);
-    if (t < align_len) {
-      dst[t] = src[t];
-    }
-    src += align_len;
-    dst += align_len;
-    len -= align_len;
-  }
-  src_align_bytes = (uint32_t)(3 & reinterpret_cast<uintptr_t>(src));
-  src_align_bits = src_align_bytes << 3;
-  while (len >= 32) {
-    auto const *src32 =
-        reinterpret_cast<uint32_t const *>(src - src_align_bytes);
-    uint32_t copy_cnt = min(len >> 2, 1024);
-    if (t < copy_cnt) {
-      uint32_t v = src32[t];
-      if (src_align_bits != 0) {
-        v = __funnelshift_r(v, src32[t + 1], src_align_bits);
+public:
+  /**
+   * \brief Applies the strategy.
+   *
+   * \param[inout] s decompression state
+   * \param[in] t warp lane index, i.e. threadIdx.x % warpsize.
+   */
+  __device__ static inline void apply(volatile INFLATE_STATE_S *s,
+                                      const int t) {
+    uint8_t const *cur_p = s->pref.cur_p;
+    uint8_t const *end = s->end;
+    while (SHFL10((t == 0) ? s->pref.run : 0)) {
+      auto cur_lo = (int32_t)(size_t)cur_p;
+      int do_pref = SHFL10((t == 0) ? (cur_lo - *(volatile int32_t *)&s->cur <
+                                       PREFETCH_SIZE - warpsize * 4 - 4)
+                                    : 0);
+      if (do_pref) {
+        uint8_t const *p = cur_p + 4 * t;
+        *prefetch_addr32(s->pref, p) =
+            (p < end) ? *reinterpret_cast<uint32_t const *>(p) : 0;
+        cur_p += 4 * warpsize;
+        __threadfence_block();
+        SYNCWARP();
+        if (!t) {
+          s->pref.cur_p = cur_p;
+          __threadfence_block();
+        }
       }
-      reinterpret_cast<uint32_t *>(dst)[t] = v;
     }
-    src += copy_cnt * 4;
-    dst += copy_cnt * 4;
-    len -= copy_cnt * 4;
   }
-  if (t < len) {
-    dst[t] = src[t];
-  }
-}
+};
 
-void gpu_copy_uncompressed_blocks(
-    device_span<device_span<uint8_t const> const> inputs,
-    device_span<device_span<uint8_t> const> outputs, hipStream_t stream) {
-  if (inputs.size() > 0) {
-    copy_uncompressed_kernel<<<inputs.size(), 1024, 0, stream>>>(inputs,
-                                                                 outputs);
-  }
-}
-
-} // namespace gzip
+} // namespace deflate
 } // namespace hipcomp
