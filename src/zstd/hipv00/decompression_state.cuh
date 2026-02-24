@@ -214,8 +214,6 @@ typedef int16_t S16;
 
 typedef U32 HUF_DTable;
 
-typedef unsigned long long ZSTD_TraceCtx;
-
 static DEVICE_CONSTANT const U8 LL_bits[MaxLL + 1] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  0,  0,  0,  0,  1,  1,
     1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -453,12 +451,6 @@ struct ZSTD_DCtx_s {
   size_t staticSize;
   int isFrameDecompression;
 
-#if 0
-#if DYNAMIC_BMI2
-  int bmi2;                     /* == 1 if the CPU supports BMI2 and 0 otherwise. CPU support is determined dynamically once per context lifetime. */
-#endif
-#endif //: NOTE(HIP/AMD): BMI2 only relevant for compression as of ZSTD V1.5.7
-
   /* dictionary */
   ZSTD_DDict *ddictLocal;
   const ZSTD_DDict *
@@ -475,9 +467,6 @@ struct ZSTD_DCtx_s {
   int maxBlockSizeParam;
 
   /* streaming */
-#if 0
-    ZSTD_dStreamStage streamStage;
-#endif //: NOTE(HIP/AMD): we do not support streaming
   char *inBuff;
   size_t inBuffSize;
   size_t inPos;
@@ -511,16 +500,6 @@ struct ZSTD_DCtx_s {
   BYTE headerBuffer[ZSTD_FRAMEHEADERSIZE_MAX];
   size_t oversizedDuration;
 
-#if 0
-#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-    void const* dictContentBeginForFuzzing;
-    void const* dictContentEndForFuzzing;
-#endif
-#endif //: NOTE(HIP/AMD): we do not support fuzzing
-       /* Tracing */
-#if ZSTD_TRACE
-  ZSTD_TraceCtx traceCtx;
-#endif
 }; /* typedef'd to ZSTD_DCtx within "zstd.h" */
 
 DEVICE_INLINE int ZSTD_DCtx_get_bmi2(const struct ZSTD_DCtx_s *dctx) {

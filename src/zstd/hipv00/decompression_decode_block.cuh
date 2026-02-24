@@ -785,16 +785,7 @@ ZSTD_buildFSETable(ZSTD_seqSymbol *dt, const short *normalizedCounter,
                    unsigned maxSymbolValue, const U32 *baseValue,
                    const U8 *nbAdditionalBits, unsigned tableLog, void *wksp,
                    size_t wkspSize, int bmi2) {
-// NOTE(HIP/AMD): No DYNAMIC_BMI support
-#if 0
-#if DYNAMIC_BMI2
-    if (bmi2) {
-        ZSTD_buildFSETable_body_bmi2(dt, normalizedCounter, maxSymbolValue,
-                baseValue, nbAdditionalBits, tableLog, wksp, wkspSize);
-        return;
-    }
-#endif
-#endif
+  // NOTE(HIP/AMD): No DYNAMIC_BMI support
   (void)bmi2;
   ZSTD_buildFSETable_body_default(dt, normalizedCounter, maxSymbolValue,
                                   baseValue, nbAdditionalBits, tableLog, wksp,
@@ -1757,23 +1748,6 @@ size_t ZSTD_decompressSequences_bodySplitLitBuffer(
                              *
                              *   https://gist.github.com/terrelln/9889fc06a423fd5ca6e99351564473f4
                              */
-#if 0                       // TODO(HIP/AMD): Disabled for now, revisit this
-#if defined(__GNUC__) && defined(__x86_64__)
-            __asm__(".p2align 6");
-#if __GNUC__ >= 7
-	    /* good for gcc-7, gcc-9, and gcc-11 */
-            __asm__("nop");
-            __asm__(".p2align 5");
-            __asm__("nop");
-            __asm__(".p2align 4");
-#if __GNUC__ == 8 || __GNUC__ == 10
-	    /* good for gcc-8 and gcc-10 */
-            __asm__("nop");
-            __asm__(".p2align 3");
-#endif
-#endif
-#endif
-#endif // 0
 
       /* Handle the initial state where litBuffer is currently split between dst
        * and litExtraBuffer */
@@ -1841,25 +1815,6 @@ size_t ZSTD_decompressSequences_bodySplitLitBuffer(
 
     if (nbSeq > 0) {
       /* there is remaining lit from extra buffer */
-
-#if 0 // TODO(HIP/AMD): Disabled for now, revisit this
-#if defined(__GNUC__) && defined(__x86_64__)
-            __asm__(".p2align 6");
-            __asm__("nop");
-#if __GNUC__ != 7
-            /* worse for gcc-7 better for gcc-8, gcc-9, and gcc-10 and clang */
-            __asm__(".p2align 4");
-            __asm__("nop");
-            __asm__(".p2align 3");
-#elif __GNUC__ >= 11
-            __asm__(".p2align 3");
-#else
-            __asm__(".p2align 5");
-            __asm__("nop");
-            __asm__(".p2align 3");
-#endif
-#endif
-#endif // 0
 
       for (; nbSeq; nbSeq--) {
         seq_t const sequence =
@@ -1962,24 +1917,6 @@ size_t ZSTD_decompressSequences_body(ZSTD_DCtx *dctx, void *dst,
     ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr);
     ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr);
     assert(dst != NULL);
-
-#if 0 // TODO(HIP/AMD): We disable these inliny assembly instructions that seem
-      // to be mainly targeted towards Intel CPUs
-#if defined(__GNUC__) && defined(__x86_64__)
-            __asm__(".p2align 6");
-            __asm__("nop");
-#if __GNUC__ >= 7
-            __asm__(".p2align 5");
-            __asm__("nop");
-            __asm__(".p2align 3");
-#else
-            __asm__(".p2align 4");
-            __asm__("nop");
-            __asm__(".p2align 3");
-#endif
-#endif
-#endif // TODO(HIP/AMD): We disable these inliny assembly instructions that seem
-       // to be mainly targeted towards Intel CPUs
 
     for (; nbSeq; nbSeq--) {
       seq_t const sequence =
@@ -2298,68 +2235,11 @@ DEVICE_INLINE size_t ZSTD_decompressSequencesLong_default(
 }
 #endif /* ZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT */
 
-#if DYNAMIC_BMI2
-
-#ifndef ZSTD_FORCE_DECOMPRESS_SEQUENCES_LONG
-
-#if 0 // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-      // instructions
-DEVICE_INLINE
-size_t
-ZSTD_decompressSequences_bmi2(ZSTD_DCtx* dctx,
-                                 void* dst, size_t maxDstSize,
-                           const void* seqStart, size_t seqSize, int nbSeq,
-                           const ZSTD_longOffset_e isLongOffset)
-{
-    return ZSTD_decompressSequences_body(dctx, dst, maxDstSize, seqStart, seqSize, nbSeq, isLongOffset);
-}
-#endif
-
-#if 0  // NOTE(HIP/AMD): This is for ZSTD_split mode that we do not support
-DEVICE_INLINE
-size_t
-ZSTD_decompressSequencesSplitLitBuffer_bmi2(ZSTD_DCtx* dctx,
-                                 void* dst, size_t maxDstSize,
-                           const void* seqStart, size_t seqSize, int nbSeq,
-                           const ZSTD_longOffset_e isLongOffset)
-{
-    return ZSTD_decompressSequences_bodySplitLitBuffer(dctx, dst, maxDstSize, seqStart, seqSize, nbSeq, isLongOffset);
-}
-#endif // NOTE(HIP/AMD): This is for ZSTD_split mode that we do not support
-#endif /* ZSTD_FORCE_DECOMPRESS_SEQUENCES_LONG */
-
-#ifndef ZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT
-#if 0  // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-       // instructions
-DEVICE_INLINE
-size_t
-ZSTD_decompressSequencesLong_bmi2(ZSTD_DCtx* dctx,
-                                 void* dst, size_t maxDstSize,
-                           const void* seqStart, size_t seqSize, int nbSeq,
-                           const ZSTD_longOffset_e isLongOffset)
-{
-    return ZSTD_decompressSequencesLong_body(dctx, dst, maxDstSize, seqStart, seqSize, nbSeq, isLongOffset);
-}
-#endif // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-       // instructions
-#endif /* ZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT */
-
-#endif /* DYNAMIC_BMI2 */
-
 #ifndef ZSTD_FORCE_DECOMPRESS_SEQUENCES_LONG
 DEVICE_INLINE size_t ZSTD_decompressSequences(
     ZSTD_DCtx *dctx, void *dst, size_t maxDstSize, const void *seqStart,
     size_t seqSize, int nbSeq, const ZSTD_longOffset_e isLongOffset) {
   DEBUGLOG(5, "ZSTD_decompressSequences");
-
-#if 0  // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-       // instructions
-    if (ZSTD_DCtx_get_bmi2(dctx)) {
-        return ZSTD_decompressSequences_bmi2(dctx, dst, maxDstSize, seqStart, seqSize, nbSeq, isLongOffset);
-    }
-#endif // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-       // instructions
-
   return ZSTD_decompressSequences_default(dctx, dst, maxDstSize, seqStart,
                                           seqSize, nbSeq, isLongOffset);
 }
@@ -2384,15 +2264,6 @@ DEVICE_INLINE size_t ZSTD_decompressSequencesLong(
     ZSTD_DCtx *dctx, void *dst, size_t maxDstSize, const void *seqStart,
     size_t seqSize, int nbSeq, const ZSTD_longOffset_e isLongOffset) {
   DEBUGLOG(5, "ZSTD_decompressSequencesLong");
-#if 0 // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-      // instructions
-#if DYNAMIC_BMI278
-    if (ZSTD_DCtx_get_bmi2(dctx)) {
-        return ZSTD_decompressSequencesLong_bmi2(dctx, dst, maxDstSize, seqStart, seqSize, nbSeq, isLongOffset);
-    }
-#endif
-#endif // NOTE(HIP/AMD): We do support CPU-specific variant that uses bmi
-       // instructions
   return ZSTD_decompressSequencesLong_default(dctx, dst, maxDstSize, seqStart,
                                               seqSize, nbSeq, isLongOffset);
 }
