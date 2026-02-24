@@ -50,9 +50,6 @@ sudo apt-get install liblz4-1
 # Snappy
 sudo apt-get install libsnappy-dev
 sudo apt-get install libsnappy1v5
-# Zstandard
-sudo apt-get install libzstd-dev
-sudo apt-get install libzstd1
 -->
 
 ```sh
@@ -62,4 +59,7 @@ sudo apt-get install zlib1g
 # Libdeflate
 sudo apt-get install libdeflate-dev
 sudo apt-get install libdeflate0
+# Zstandard
+sudo apt-get install libzstd-dev
+sudo apt-get install libzstd1
 ```

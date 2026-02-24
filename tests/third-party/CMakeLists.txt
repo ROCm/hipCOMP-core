@@ -15,7 +15,7 @@
 
 # MIT License
 #
-# Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (C) 2023-2026 Advanced Micro Devices, Inc. All rights
 # reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -35,39 +35,57 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+cmake_minimum_required(VERSION 3.18)
+option(CUDA_BACKEND
+       "Build for CUDA devices. Default configuration builds for AMD devices."
+       OFF)
 
 find_package(ZLIB)
 find_path(LIBDEFLATE_INCLUDE_DIR NAMES libdeflate.h)
 find_library(LIBDEFLATE_LIBRARY NAMES deflate)
+
+if(CUDA_BACKEND)
+  find_package(CUDAToolkit REQUIRED)
+  find_package(nvcomp REQUIRED)
+  project(nvcomp-tests LANGUAGES CUDA CXX)
+  set(HIPCOMP_LIBRARY nvcomp::nvcomp)
+else()
+  find_package(hipcomp REQUIRED)
+  project(nvcomp-tests LANGUAGES HIP CXX)
+  set(HIPCOMP_LIBRARY hipcomp)
+endif()
 
 # Add Deflate CPU compression GPU decompression test
 if(ZLIB_FOUND
    AND LIBDEFLATE_INCLUDE_DIR
    AND LIBDEFLATE_LIBRARY)
   set(TESTNAME deflate_cpu_compression_test)
-  set_source_files_properties(${TESTNAME}.cu PROPERTIES LANGUAGE HIP)
   add_executable(${TESTNAME} ${TESTNAME}.cu)
   if(CUDA_BACKEND)
+    target_compile_definitions(${TESTNAME} PRIVATE CUDA_BACKEND)
     if(NOT MSVC)
-      target_link_libraries(${TESTNAME} PRIVATE hipcomp ${LIBDEFLATE_LIBRARY}
-                                                ZLIB::ZLIB CUDA::cudart_static)
+      target_link_libraries(
+        ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${LIBDEFLATE_LIBRARY} ZLIB::ZLIB
+                            CUDA::cudart_static)
     else()
       # Including CUDA::cudart on Windows resulted in multiple definition linker
       # errors for gdeflate and bitcomp tests, since cudart_static.lib is
       # already included.
-      target_link_libraries(${TESTNAME} PRIVATE hipcomp ${LIBDEFLATE_LIBRARY}
-                                                ZLIB::ZLIB)
+      target_link_libraries(
+        ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${LIBDEFLATE_LIBRARY} ZLIB::ZLIB)
     endif()
   else()
-    target_link_libraries(${TESTNAME} PRIVATE hipcomp ${LIBDEFLATE_LIBRARY}
-                                              ZLIB::ZLIB hip::host hip::device)
+    set_source_files_properties(${TESTNAME}.cu PROPERTIES LANGUAGE HIP)
+    target_link_libraries(
+      ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${LIBDEFLATE_LIBRARY} ZLIB::ZLIB
+                          hip::host hip::device)
   endif()
   target_include_directories(${TESTNAME} PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
   add_test(NAME ${TESTNAME} COMMAND ${TESTNAME})
 else()
   message(
     WARNING
-      "Skipping building Deflate CPU example, as the zlib and/or libdeflate libraries were not found."
+      "Skipping building Deflate CPU compression GPU decompression test, as the zlib and/or libdeflate libraries were not found."
   )
 endif()
 
@@ -76,28 +94,72 @@ if(ZLIB_FOUND
    AND LIBDEFLATE_INCLUDE_DIR
    AND LIBDEFLATE_LIBRARY)
   set(TESTNAME gzip_cpu_compression_test)
-  set_source_files_properties(${TESTNAME}.cu PROPERTIES LANGUAGE HIP)
   add_executable(${TESTNAME} ${TESTNAME}.cu)
   if(CUDA_BACKEND)
+    target_compile_definitions(${TESTNAME} PRIVATE CUDA_BACKEND)
     if(NOT MSVC)
-      target_link_libraries(${TESTNAME} PRIVATE hipcomp ${LIBDEFLATE_LIBRARY}
-                                                ZLIB::ZLIB CUDA::cudart_static)
+      target_link_libraries(
+        ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${LIBDEFLATE_LIBRARY} ZLIB::ZLIB
+                            CUDA::cudart_static)
     else()
       # Including CUDA::cudart on Windows resulted in multiple definition linker
       # errors for gdeflate and bitcomp tests, since cudart_static.lib is
       # already included.
-      target_link_libraries(${TESTNAME} PRIVATE hipcomp ${LIBDEFLATE_LIBRARY}
-                                                ZLIB::ZLIB)
+      target_link_libraries(
+        ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${LIBDEFLATE_LIBRARY} ZLIB::ZLIB)
     endif()
   else()
-    target_link_libraries(${TESTNAME} PRIVATE hipcomp ${LIBDEFLATE_LIBRARY}
-                                              ZLIB::ZLIB hip::host hip::device)
+    set_source_files_properties(${TESTNAME}.cu PROPERTIES LANGUAGE HIP)
+    target_link_libraries(
+      ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${LIBDEFLATE_LIBRARY} ZLIB::ZLIB
+                          hip::host hip::device)
   endif()
   target_include_directories(${TESTNAME} PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
   add_test(NAME ${TESTNAME} COMMAND ${TESTNAME})
 else()
   message(
     WARNING
-      "Skipping building Deflate CPU example, as the zlib and/or libdeflate libraries were not found."
+      "Skipping building Deflate CPU compression GPU decompression test, as the zlib and/or libdeflate libraries were not found."
+  )
+endif()
+
+# Add ZSTD CPU compression GPU decompression test
+find_path(ZSTD_INCLUDE_DIR NAMES zstd.h)
+find_library(ZSTD_LIBRARY NAMES zstd)
+if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+  set(ZSTD_TESTS zstd_cpu_compression_test
+                 zstd_cpu_compression_cpu_decompression_test)
+  foreach(TESTNAME IN LISTS ZSTD_TESTS)
+    add_executable(${TESTNAME} ${TESTNAME}.cu)
+    target_include_directories(${TESTNAME} PRIVATE ${ZSTD_INCLUDE_DIR})
+    if(CUDA_BACKEND)
+      target_compile_definitions(${TESTNAME} PRIVATE CUDA_BACKEND)
+      if(NOT MSVC)
+        target_link_libraries(
+          ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${ZSTD_LIBRARY}
+                              CUDA::cudart_static)
+      else()
+        # Including CUDA::cudart on Windows resulted in multiple definition
+        # linker errors for gdeflate and bitcomp tests, since cudart_static.lib
+        # is already included.
+        target_link_libraries(${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY}
+                                                  ${ZSTD_LIBRARY})
+      endif()
+    else()
+      set_source_files_properties(${TESTNAME}.cu PROPERTIES LANGUAGE HIP)
+      target_link_libraries(
+        ${TESTNAME} PRIVATE ${HIPCOMP_LIBRARY} ${ZSTD_LIBRARY} hip::host
+                            hip::device)
+    endif()
+    # NOTE: We do not register 'zstd_cpu_compression_cpu_decompression_test' as
+    # test. We just build it. It is more like a benchmark.
+    if(NOT "${TESTNAME}" STREQUAL "zstd_cpu_compression_cpu_decompression_test")
+      add_test(NAME ${TESTNAME} COMMAND ${TESTNAME})
+    endif()
+  endforeach()
+else()
+  message(
+    WARNING
+      "Skipping building Zstandard CPU compression GPU decompression test, as the Zstandard library was not found."
   )
 endif()
