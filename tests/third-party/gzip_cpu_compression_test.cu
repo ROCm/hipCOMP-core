@@ -18,7 +18,7 @@
 
 // MIT License
 //
-// Modifications Copyright (C) 2023-2025 Advanced Micro Devices, Inc. All rights
+// Modifications Copyright (C) 2023-2026 Advanced Micro Devices, Inc. All rights
 // reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -43,24 +43,16 @@
 
 #include "BatchData.hpp"
 #include "catch.hpp"
+#if defined(CUDA_BACKEND)
+#include "nvcomp/gzip.h"
+#else
 #include "hipcomp/gzip.h"
+#endif
 #include "zlib.h"
 
 #include <iostream>
 #include <string>
 #include <vector>
-
-#define nvcompAlignmentRequirements_t hipcompAlignmentRequirements_t
-#define nvcompBatchedGzipDecompressAsync hipcompBatchedGzipDecompressAsync
-#define nvcompBatchedGzipDecompressDefaultOpts                                 \
-  hipcompBatchedGzipDecompressDefaultOpts
-#define nvcompBatchedGzipDecompressGetRequiredAlignments                       \
-  hipcompBatchedGzipDecompressGetRequiredAlignments
-#define nvcompBatchedGzipDecompressGetTempSizeAsync                            \
-  hipcompBatchedGzipDecompressGetTempSize
-#define nvcompBatchedGzipDecompressOpts_t hipcompBatchedGzipDecompressOpts_t
-#define nvcompStatus_t hipcompStatus_t
-#define nvcompSuccess hipcompSuccess
 
 static void run_test(const std::vector<std::vector<char>> &data, int algo,
                      int compression_level, size_t warmup_iteration_count,
@@ -133,31 +125,45 @@ static void run_test(const std::vector<std::vector<char>> &data, int algo,
             << (double)total_bytes / comp_bytes << std::endl;
 
   nvcompStatus_t status = nvcompSuccess;
-  // // Decompression options
-  // nvcompBatchedGzipDecompressOpts_t decompress_opts =
-  //     nvcompBatchedGzipDecompressDefaultOpts;
+#ifdef CUDA_BACKEND
+  // Decompression options
+  nvcompBatchedGzipDecompressOpts_t decompress_opts =
+      nvcompBatchedGzipDecompressDefaultOpts;
 
-  // // Query decompression alignment requirements
-  // nvcompAlignmentRequirements_t decompression_alignment_reqs;
-  // nvcompStatus_t status =
-  // nvcompBatchedGzipDecompressGetRequiredAlignments(
-  //     decompress_opts, &decompression_alignment_reqs);
-  // if (status != nvcompSuccess) {
-  //   throw std::runtime_error(
-  //       "ERROR: nvcompBatchedGzipDecompressGetRequiredAlignments() not "
-  //       "successful");
-  // }
+  // Query decompression alignment requirements
+  nvcompAlignmentRequirements_t decompression_alignment_reqs_s;
+  status = nvcompBatchedGzipDecompressGetRequiredAlignments(
+      decompress_opts, &decompression_alignment_reqs_s);
+  if (status != nvcompSuccess) {
+    throw std::runtime_error(
+        "ERROR: nvcompBatchedGzipDecompressGetRequiredAlignments() not "
+        "successful");
+  }
+  auto decompression_alignment_reqs_in = decompression_alignment_reqs_s.input;
+  auto decompression_alignment_reqs_out = decompression_alignment_reqs_s.output;
+#else
+  auto decompression_alignment_reqs_in = hipcompGzipRequiredAlignment;
+  auto decompression_alignment_reqs_out = hipcompGzipRequiredAlignment;
+#endif
 
   // Copy compressed data to GPU
   BatchData compressed_data(compressed_data_cpu, true,
-                            hipcompGzipRequiredAlignment);
+                            decompression_alignment_reqs_in);
 
   // Allocate and build up decompression batch on GPU
-  BatchData decomp_data(input_data_cpu, false, hipcompGzipRequiredAlignment);
+  BatchData decomp_data(input_data_cpu, false,
+                        decompression_alignment_reqs_out);
 
   // Create CUDA stream
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
+
+  // Allocate necessary buffers
+  nvcompStatus_t *d_status_ptrs;
+  CUDA_CHECK(cudaMalloc(&d_status_ptrs, chunk_count * sizeof(nvcompStatus_t)));
+
+  size_t *d_decomp_sizes;
+  CUDA_CHECK(cudaMalloc(&d_decomp_sizes, chunk_count * sizeof(size_t)));
 
   // CUDA events to measure decompression time
   cudaEvent_t start, end;
@@ -165,22 +171,43 @@ static void run_test(const std::vector<std::vector<char>> &data, int algo,
   CUDA_CHECK(cudaEventCreate(&end));
 
   // deflate GPU decompression
-  size_t decomp_temp_bytes;
+  // Determine scratch space needed asynchronously
+  size_t decomp_temp_bytes_async;
   status = nvcompBatchedGzipDecompressGetTempSizeAsync(
-      chunk_count, 0 /* max uncompressed size */, &decomp_temp_bytes);
+#ifdef CUDA_BACKEND
+      chunk_count, chunk_size, decompress_opts, &decomp_temp_bytes,
+      chunk_count * chunk_size
+#else
+      chunk_count, 0 /* max uncompressed size */, &decomp_temp_bytes_async
+#endif
+  );
   if (status != nvcompSuccess) {
     throw std::runtime_error(
         "nvcompBatchedGzipDecompressGetTempSizeAsync() failed.");
   }
 
+#ifdef CUDA_BACKEND // TODO Currently not available with HIP
+  // Determine scratch space needed synchronously
+  size_t decomp_temp_bytes_sync;
+  status = nvcompBatchedGzipDecompressGetTempSizeSync(
+      compressed_data.ptrs(), compressed_data.sizes(), chunk_count, chunk_size,
+      &decomp_temp_bytes_sync, chunk_size * chunk_count,
+#ifdef CUDA_BACKEND
+      decompress_opts,
+#endif
+      d_status_ptrs, stream);
+  if (status != nvcompSuccess) {
+    throw std::runtime_error(
+        "nvcompBatchedGzipDecompressGetTempSizeSync() failed.");
+  }
+  size_t decomp_temp_bytes =
+      std::min(decomp_temp_bytes_sync, decomp_temp_bytes_async);
+#else
+  size_t decomp_temp_bytes = decomp_temp_bytes_async;
+#endif
+
   void *d_decomp_temp;
   CUDA_CHECK(cudaMalloc(&d_decomp_temp, decomp_temp_bytes));
-
-  size_t *d_decomp_sizes;
-  CUDA_CHECK(cudaMalloc(&d_decomp_sizes, chunk_count * sizeof(size_t)));
-
-  nvcompStatus_t *d_status_ptrs;
-  CUDA_CHECK(cudaMalloc(&d_status_ptrs, chunk_count * sizeof(nvcompStatus_t)));
 
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -188,12 +215,20 @@ static void run_test(const std::vector<std::vector<char>> &data, int algo,
     if (nvcompBatchedGzipDecompressAsync(
             compressed_data.ptrs(), compressed_data.sizes(),
             decomp_data.sizes(), d_decomp_sizes, chunk_count, d_decomp_temp,
-            decomp_temp_bytes, decomp_data.ptrs(), /*decompress_opts,*/
+            decomp_temp_bytes, decomp_data.ptrs(),
+#ifdef CUDA_BACKEND
+            decompress_opts,
+#endif
             d_status_ptrs, stream) != nvcompSuccess) {
       throw std::runtime_error(
           "ERROR: nvcompBatchedGzipDecompressAsync() not successful");
     }
   };
+
+  // Run warm-up decompression
+  for (size_t iter = 0; iter < warmup_iteration_count; ++iter) {
+    perform_decompression();
+  }
 
   // Run warm-up decompression
   for (size_t iter = 0; iter < warmup_iteration_count; ++iter) {

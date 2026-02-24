@@ -36,22 +36,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 cmake_minimum_required(VERSION 3.18)
-option(CUDA_BACKEND
-       "Build for CUDA devices. Default configuration builds for AMD devices."
-       OFF)
+option(
+  STANDALONE_NVCOMP_PROJECT
+  "Build the tests as standalone CUDA project that depends on NVCOMP. Always sets CUDA_BACKEND to 'True'."
+  OFF)
 
 find_package(ZLIB)
 find_path(LIBDEFLATE_INCLUDE_DIR NAMES libdeflate.h)
 find_library(LIBDEFLATE_LIBRARY NAMES deflate)
 
-if(CUDA_BACKEND)
-  find_package(CUDAToolkit REQUIRED)
-  find_package(nvcomp REQUIRED)
+if(STANDALONE_NVCOMP_PROJECT)
+  set(CUDA_BACKEND ON)
   project(nvcomp-tests LANGUAGES CUDA CXX)
+  find_package(nvcomp REQUIRED)
+  find_package(CUDAToolkit REQUIRED)
   set(HIPCOMP_LIBRARY nvcomp::nvcomp)
 else()
-  find_package(hipcomp REQUIRED)
-  project(nvcomp-tests LANGUAGES HIP CXX)
+  option(CUDA_BACKEND
+         "Build for CUDA devices. Default configuration builds for AMD devices."
+         OFF)
   set(HIPCOMP_LIBRARY hipcomp)
 endif()
 
