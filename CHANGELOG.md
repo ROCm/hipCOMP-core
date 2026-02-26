@@ -1,6 +1,25 @@
-# hipCOMP changelog (YYYY-MM-DD)
+# hipCOMP 2.3.0 (2026-02-26)
 
-# nvCOMP changelog
+## New Features
+- **Zstandard/ZSTD Decompression Support**: Add GPU-accelerated ZSTD decompression
+  - Initial HIP C++ port of Meta's ZSTD CPU decompressor
+  - Supports wavefront 32 and 64 AMD GPUs (not tested on CUDA&reg; devices)
+  - `litExtraBuffer` size is set to 32 KiB (half of x86-64 buffer size) so that
+     decompression context fits in 64 KiB LDS of majority of AMD GPUs
+- **GZIP/Deflate Decompression Support**: Add GPU-accelerated GZIP and Deflate
+  decompression
+  - 3-wave (prefetch, decode, process symbols) implementation derived from
+    NVIDIA RAPIDS&reg; cuDF's GZIP/Deflate decompressor for CUDA devices
+  - Support for standard GZIP and Deflate compressed data
+  - Supports wavefront 32 and 64 AMD GPUs (not tested on CUDA devices)
+
+## Tests
+- Added ZSTD, GZIP, and Deflate GPU decompression tests (compression is performed on the CPU using standard libraries)
+
+# hipCOMP 2.2.0
+
+- Initial HIP C++ port of all nvCOMP 2.2.0 algorithms
+- Implementations are experimental and not yet performance-optimized for AMD hardware
 
 # nvcomp 2.2.0 (2022-02-07)
 ## New Features

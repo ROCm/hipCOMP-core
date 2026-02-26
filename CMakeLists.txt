@@ -52,7 +52,7 @@ cmake_minimum_required(VERSION 3.21) # HIP language support requires 3.21
 cmake_policy(VERSION 3.21.3...3.27)
 project(
   hipcomp
-  VERSION 2.2.0
+  VERSION 2.3.0
   LANGUAGES C CXX)
 
 option(CUDA_BACKEND
