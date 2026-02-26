@@ -249,13 +249,82 @@ CUDALibrarySamples that are licensed under the Apache 2.0 license:
 
 * FILES:
   * ``cmake/hipcomp-config.cmake.in``
+  * ``include/hipcomp/zstd.h``
+  * ``include/hipcomp/zstd.hpp``
   * ``src/SnappyBlockUtils.cuh``
   * ``src/SnappyKernels.cu``
+  * ``src/zstd/hipv00/decompression.cuh``
 
 * HOMEPAGE: https://github.com/NVIDIA/CUDALibrarySamples
 
 * FILES:
-  * ``deflate_cpu_compression_test.cpp``
+  * ``tests/third-party/CMakeLists.txt``
+  * ``tests/third-party/deflate_cpu_compression_test.cu``
+  * ``tests/third-party/gzip_cpu_compression_test.cu``
+  * ``tests/third-party/zstd_cpu_compression_test.cu``
+  * ``tests/third-party/zstd_cpu_compression_cpu_decompression_test.cu``
+
+## Files Subject to the BSD 3-Clause License (Zstandard/Facebook/Meta)
+
+This project contains code derived from the Zstandard compression library
+(https://github.com/facebook/zstd) that is licensed under the BSD 3-Clause License:
+
+* LICENSE TEXT:
+
+  ```
+  BSD License
+
+  For Zstandard software
+
+  Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without modification,
+  are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+  * Neither the name Facebook, nor Meta, nor the names of its contributors may
+    be used to endorse or promote products derived from this software without
+    specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+  ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+  ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  ```
+
+* HOMEPAGE: https://github.com/facebook/zstd
+
+* FILES:
+  * ``share/zstd/decompression/preprocessed_zstd_files/common.h``
+  * ``share/zstd/decompression/preprocessed_zstd_files/decompression_context.h``
+  * ``share/zstd/decompression/preprocessed_zstd_files/fse_decompress.i.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/fse_decompress.stripped.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/fse_decompress.stripped.without_common_apis.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/huf_decompress.i.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/huf_decompress.stripped.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/huf_decompress.stripped.without_common_apis.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_ddict.i.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_ddict.stripped.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_ddict.stripped.without_common_apis.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_decompress.i.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_decompress.stripped.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_decompress.stripped.without_common_apis.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_decompress_block.i.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_decompress_block.stripped.c``
+  * ``share/zstd/decompression/preprocessed_zstd_files/zstd_decompress_block.stripped.without_common_apis.c``
+  * ``src/zstd/hipv00/xxhash.cuh``
 
 ## Files Subject to the Boost Software Lincese, Version 1.0
 
@@ -272,7 +341,7 @@ This project contains work derived that is licensed under the Boost Software Lic
 
 * FILES:
 
-  * ``tests/catch.hpp``
+  * ``tests/third-party/catch.hpp``
 
 ## Other Files and Modifications: MIT License
 
