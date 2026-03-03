@@ -63,7 +63,7 @@ extern "C" {
  *****************************************************************************/
 
 #define HIPCOMP_MAJOR_VERSION 2
-#define HIPCOMP_MINOR_VERSION 2
+#define HIPCOMP_MINOR_VERSION 3
 #define HIPCOMP_PATCH_VERSION 0
 
 /* Supported datatypes */
