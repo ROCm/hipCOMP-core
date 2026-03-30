@@ -313,32 +313,45 @@ write_basic_package_version_file(
   VERSION "${HIPCOMP_VERSION}"
   COMPATIBILITY SameMinorVersion)
 
+# Install hipcomp library to main component
 install(
   TARGETS hipcomp
   EXPORT hipcomp-exports
+  COMPONENT main
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+
+# Install CMake export files to devel component
 install(
   EXPORT hipcomp-exports
   FILE hipcomp-targets.cmake
   NAMESPACE hipcomp::
-  DESTINATION "${INSTALL_CONFIGDIR}")
+  DESTINATION "${INSTALL_CONFIGDIR}"
+  COMPONENT devel)
 
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/hipcomp/
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hipcomp)
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/hipcomp.hpp
-              ${CMAKE_CURRENT_SOURCE_DIR}/include/hipcomp.h
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/cmake/hipcomp-config.cmake"
-              "${CMAKE_CURRENT_BINARY_DIR}/cmake/hipcomp-config-version.cmake"
-        DESTINATION "${INSTALL_CONFIGDIR}")
+# Install header files to devel component
+install(
+  DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/hipcomp/
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hipcomp
+  COMPONENT devel)
+install(
+  FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/hipcomp.hpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/hipcomp.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  COMPONENT devel)
+
+# Install CMake config files to devel component
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/cmake/hipcomp-config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/cmake/hipcomp-config-version.cmake"
+  DESTINATION "${INSTALL_CONFIGDIR}"
+  COMPONENT devel)
 
 # ------
-# Packaging NOTE For the time being, we put lib and dev files into the same
-# package. NOTE We need to consider to move to ROCm CMake from raw CPACK
-set(CPACK_PACKAGE_NAME "rocm-hipcomp-core")
+# Component-based packaging configuration
+set(CPACK_PACKAGE_NAME "hipcomp-core")
 set(CPACK_PACKAGE_VENDOR "Advanced Micro Devices, Inc.")
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${CPACK_PACKAGE_VENDOR}")
 set(CPACK_OUTPUT_FILE_PREFIX
@@ -347,8 +360,38 @@ set(CPACK_OUTPUT_FILE_PREFIX
 set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
 set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
-set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_PACKAGING_INSTALL_PREFIX
     "/opt/rocm"
     CACHE PATH "Package install prefix.")
+
+# Enable component-based packaging
+set(CPACK_COMPONENTS_ALL main devel)
+
+# Component descriptions
+set(CPACK_COMPONENT_MAIN_DISPLAY_NAME "hipCOMP Runtime Library")
+set(CPACK_COMPONENT_MAIN_DESCRIPTION
+    "hipCOMP runtime library for data compression on GPU")
+set(CPACK_COMPONENT_DEVEL_DISPLAY_NAME "hipCOMP Development Files")
+set(CPACK_COMPONENT_DEVEL_DESCRIPTION
+    "Headers and CMake files for developing with hipCOMP")
+set(CPACK_COMPONENT_DEVEL_DEPENDS main)
+
+# DEB-specific component packaging
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+set(CPACK_DEBIAN_ENABLE_COMPONENT_DEPENDS ON)
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_MAIN_PACKAGE_NAME "${CPACK_PACKAGE_NAME}")
+set(CPACK_DEBIAN_DEVEL_PACKAGE_NAME "${CPACK_PACKAGE_NAME}-dev")
+
+# RPM-specific component packaging
+set(CPACK_RPM_COMPONENT_INSTALL ON)
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+set(CPACK_RPM_MAIN_PACKAGE_NAME "${CPACK_PACKAGE_NAME}")
+set(CPACK_RPM_DEVEL_PACKAGE_NAME "${CPACK_PACKAGE_NAME}-devel")
+set(CPACK_RPM_MAIN_PACKAGE_SUMMARY "hipCOMP runtime library")
+set(CPACK_RPM_DEVEL_PACKAGE_SUMMARY "hipCOMP development files")
+set(CPACK_RPM_DEVEL_PACKAGE_REQUIRES
+    "${CPACK_PACKAGE_NAME} = ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}"
+)
+
 include(CPack)
