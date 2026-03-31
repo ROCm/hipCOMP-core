@@ -255,9 +255,9 @@ if(gdeflate_FOUND)
   find_package(ZLIB)
 endif()
 
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_LIBDIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${CMAKE_INSTALL_BINDIR})
 file(COPY include/ DESTINATION ${CMAKE_BINARY_DIR}/include)
 
 # determine version
@@ -277,9 +277,6 @@ if(BUILD_TESTS)
   enable_testing()
 endif()
 
-if(UNIX)
-  include(GNUInstallDirs)
-endif()
 
 add_subdirectory(src)
 
@@ -319,7 +316,10 @@ write_basic_package_version_file(
 install(
   TARGETS hipcomp
   EXPORT hipcomp-exports
-  DESTINATION lib)
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 install(
   EXPORT hipcomp-exports
   FILE hipcomp-targets.cmake
