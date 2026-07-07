@@ -31,12 +31,13 @@ experimental and not yet performance-optimized.
 ## Supported Platforms
 
 * This release of hipCOMP has been successfully tested on AMD GPUs with
-  ROCm 7.1.1, ROCm 7.2.0, TheRock 7.11.0 RC2.
+  ROCm 7.1.1, ROCm 7.2.0, ROCm 7.2.3, TheRock 7.11.0 RC2.
 * The following architectures have been tested successfully for this release:
   * gfx1030
   * gfx1100
-  * gfx90a (MI210x)
-  * gfx942 (MI300a/MI300x/MI308x)
+  * gfx90a (MI210x/MI250)
+  * gfx942 (MI300x/MI308x/MI325x)
+  * gfx950 (MI355X)
 * The library is built using CMake and the build requires a C++17 compliant
   compiler.
 * The tests for GZIP/Deflate and ZSTD require the corresponding compression
