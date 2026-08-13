@@ -41,6 +41,9 @@
 #   HIPCOMP_CORE_CPACK_GENERATORS    Semicolon separated CPack generator list.
 #                                    Defaults to the generators whose backend is
 #                                    present (RPM and/or DEB).
+#   HIPCOMP_CORE_CREATE_TESTS_TARBALL
+#                                    '0' skips packing the tests tarball the
+#                                    tester images consume (default: 1).
 #   CMAKE_INSTALL_PREFIX             Install prefix; the literal
 #                                    '<conda-prefix>' resolves to CONDA_PREFIX.
 #   CPACK_PACKAGING_INSTALL_PREFIX   Prefix baked into the packages. Defaults to
@@ -74,6 +77,11 @@ fi
 
 components="${HIPCOMP_CORE_INSTALL_COMPONENTS-devel}"
 tests_tarball_name="${PROJECT_ID}-tests.tar.gz"
+
+case "${HIPCOMP_CORE_CREATE_TESTS_TARBALL:-1}" in
+  0 | false | no | off) create_tests_tarball="" ;;
+  *) create_tests_tarball="1" ;;
+esac
 
 [[ "${CMAKE_INSTALL_PREFIX:-}" == "<conda-prefix>" ]] && install_to_conda_prefix="1"
 [[ "${SCCACHE_ENABLE:-false}" == "true" ]] && use_sccache=1
@@ -184,10 +192,12 @@ fi
 
 # The tester images extract this at / and run ctest against ${build_build_dir},
 # so the archive keeps absolute paths. The source tree comes along because the
-# tester drives ci/internal/test.sh out of it; .git would otherwise dominate
-# the archive.
-tar --exclude=.git -czvf ${BUILD_ARTIFACTS_DIR}/${tests_tarball_name} ${build_build_dir} ${src_dir}
-du -sh ${BUILD_ARTIFACTS_DIR}/${tests_tarball_name}
+# tester drives ci/internal/prepare.sh and ci/internal/test.sh out of it; .git
+# would otherwise dominate the archive.
+if [ -n "${create_tests_tarball:-}" ]; then
+  tar --exclude=.git -czvf ${BUILD_ARTIFACTS_DIR}/${tests_tarball_name} ${build_build_dir} ${src_dir}
+  du -sh ${BUILD_ARTIFACTS_DIR}/${tests_tarball_name}
+fi
 
 # inspect package contents
 if command -v dpkg >/dev/null 2>&1; then
