@@ -112,6 +112,7 @@ void test_lz4(const std::vector<T> &input, hipcompType_t data_type,
                    comp_config);
 
   HIP_CHECK(hipStreamSynchronize(stream));
+  REQUIRE(*comp_config.get_status() == hipcompSuccess);
 
   size_t comp_out_bytes = manager.get_compressed_output_size(d_comp_out);
 

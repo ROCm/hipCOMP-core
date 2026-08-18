@@ -245,6 +245,11 @@ __global__
 
   __shared__ hipcompStatus_t output_status[chunks_per_block];
 
+  if (threadIdx.x == 0) {
+    output_status[threadIdx.y] = hipcompSuccess;
+  }
+  __syncthreads();
+
   CompressT compressor{compressor_arg, free_scratch_buffer, share_buffer,
                        &output_status[threadIdx.y]};
 
@@ -269,6 +274,11 @@ __global__
       (compression_args.max_comp_chunk_size * gridDim.x * blockDim.y);
 
   __shared__ hipcompStatus_t output_status[chunks_per_block];
+
+  if (threadIdx.x == 0) {
+    output_status[threadIdx.y] = hipcompSuccess;
+  }
+  __syncthreads();
 
   CompressT compressor{free_scratch_buffer, share_buffer,
                        &output_status[threadIdx.y]};
