@@ -43,9 +43,9 @@
 #   HIPCOMP_CORE_CPACK_GENERATORS    Semicolon separated CPack generator list.
 #                                    Defaults to the generators whose backend is
 #                                    present (RPM and/or DEB).
-#   HIPCOMP_CORE_CREATE_TESTS_TARBALL
-#                                    '0' skips packing the tests tarball the
-#                                    tester images consume (default: 1).
+#   CI_INTERNAL_CREATE_TESTS_TARBALL
+#                                    '1' packs the tests tarball the tester
+#                                    images consume (default: 0).
 #   CMAKE_INSTALL_PREFIX             Install prefix, overriding INSTALL_DIR; the
 #                                    literal '<conda-prefix>' resolves to
 #                                    CONDA_PREFIX.
@@ -85,9 +85,9 @@ fi
 components="${HIPCOMP_CORE_INSTALL_COMPONENTS-devel}"
 tests_tarball_name="${PROJECT_ID}-tests.tar.gz"
 
-case "${HIPCOMP_CORE_CREATE_TESTS_TARBALL:-1}" in
-  0 | false | no | off) create_tests_tarball="" ;;
-  *) create_tests_tarball="1" ;;
+case "${CI_INTERNAL_CREATE_TESTS_TARBALL:-0}" in
+  1 | true | yes | on) create_tests_tarball="1" ;;
+  *) create_tests_tarball="" ;;
 esac
 
 [[ "${CMAKE_INSTALL_PREFIX:-}" == "<conda-prefix>" ]] && install_to_conda_prefix="1"
