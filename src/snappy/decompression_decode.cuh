@@ -81,7 +81,8 @@ private:
                                             uint32_t &dst_pos,       //: inout
                                             volatile LZ77Symbol *&b, //: inout
                                             int32_t &batch_len,      //: inout
-                                            uint32_t end             //: in
+                                            uint32_t end,            //: in
+                                            uint32_t &malformed      //: out
   ) {
     uint32_t current_prefetch_wrpos = s->q.prefetch_wrpos;
     while (bytes_left > 0 && batch_len < BATCH_SIZE &&
@@ -119,9 +120,15 @@ private:
               LZ77Symbol::decode_len_for_short_literal_or_large_offset_copy(b0);
           //: blen = (b0 >> 2) + 1;
         }
-        dst_pos += blen;
-        if (offset - 1u >= dst_pos || bytes_left < blen)
+        // `cur` has already been advanced past this symbol, so a bare break
+        // would make the outer loop resume after it and drop the corruption.
+        // `dst_pos` is still the output position this copy starts at, so a
+        // valid offset is 1..dst_pos.
+        if (offset - 1u >= dst_pos || bytes_left < blen) {
+          malformed = 1;
           break;
+        }
+        dst_pos += blen;
         bytes_left -= blen;
       } else if (b0 < 4 * 4) {
         // 0000xx00: short literal
@@ -129,9 +136,11 @@ private:
             LZ77Symbol::decode_len_for_short_literal_or_large_offset_copy(b0);
         offset = -(int32_t)(cur + 1);
         cur += 1 + blen;
-        dst_pos += blen;
-        if (bytes_left < blen)
+        if (bytes_left < blen) {
+          malformed = 1;
           break;
+        }
+        dst_pos += blen;
         bytes_left -= blen;
       } else {
         // xxxxxx00: literal
@@ -154,9 +163,11 @@ private:
         blen += 1;
         offset = -(int32_t)cur;
         cur += blen;
-        dst_pos += blen;
-        if (bytes_left < blen)
+        if (bytes_left < blen) {
+          malformed = 1;
           break;
+        }
+        dst_pos += blen;
         bytes_left -= blen;
       }
       b[batch_len].set(blen, offset, cur_orig, " (single-thread)");
@@ -221,6 +232,9 @@ public:
     for (;;) {
       int32_t batch_len = 0;
       volatile LZ77Symbol *b;
+      // Set by lane 0 when it rejects a symbol; broadcast to the whole warp
+      // below, because `s->error` is not volatile.
+      uint32_t malformed = 0;
 
       // Wait for prefetcher
       if (t == 0) {
@@ -268,7 +282,8 @@ public:
                                                   dst_pos,    //: inout
                                                   b,          //: inout
                                                   batch_len,  //: inout
-                                                  end         //: in
+                                                  end,        //: in
+                                                  malformed   //: out
         );
         if (batch_len != 0) {
           SUBMIT_BATCH_TO_SYMBOL_PROCESSOR(s, batch, batch_len);
@@ -281,10 +296,13 @@ public:
       //: is correct and out of sync with the other threads
       batch_len = SHFL10(batch_len);
       bytes_left = SHFL10(bytes_left);
+      malformed = SHFL10(malformed);
       if (t == 0) {
         WAIT_FOR_SYMBOL_PROCESSOR(s, batch);
       }
-      if (bytes_left <= 0) {
+      // Stop on a rejected symbol rather than resuming past it. `bytes_left`
+      // is non-zero here, so the shutdown below reports the error.
+      if (bytes_left <= 0 || malformed) {
         break;
       }
     }
