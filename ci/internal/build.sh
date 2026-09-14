@@ -54,6 +54,14 @@
 #                                    package for a prefix other than the one
 #                                    built against.
 #   AMDGPU_TARGETS                   GPU architectures to compile for.
+#   HIPCOMP_CORE_CMAKE_ARGS          Extra flags appended to the configure line,
+#                                    whitespace separated, e.g.
+#                                    '-D HIPCOMP_ZSTD_KERNEL_VERSION=clean'.
+#                                    Appended last, so a flag here overrides the
+#                                    same -D set above. A flag value cannot
+#                                    itself contain a space; a CMake list value
+#                                    is semicolon separated and so does not need
+#                                    one.
 #   SCCACHE_ENABLE                   'true' enables the sccache launchers.
 #   CMAKE_VERSION                    Version of the cmake package to install
 #                                    into the venv under BUILD_DIR that supplies
@@ -157,6 +165,12 @@ else
     "-D CPACK_PACKAGING_INSTALL_PREFIX=${package_prefix}"
   )
 fi
+
+# Last, so that a caller can override any -D set above. Unquoted on purpose:
+# the entries built above are single strings like '-D BUILD_TESTS=1' that the
+# configure line below already relies on word splitting to turn into two
+# arguments, and the same splitting is what separates the flags passed here.
+cmake_args+=( ${HIPCOMP_CORE_CMAKE_ARGS:-} )
 
 build_args=(
   "--parallel ${CMAKE_BUILD_PARALLEL_LEVEL:-${MAX_JOBS:-1}}"
