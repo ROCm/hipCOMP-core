@@ -781,7 +781,8 @@ function install_therock_from_tarball() {
 
       if wget --spider "${url}" 2>/dev/null; then
         printf "INFO: Found tarball for target: ${target}\n" >&2
-        wget "${url}"
+        # Without a TTY wget writes a line per 50 KiB; this is one per 48 MiB.
+        wget --progress=dot:giga "${url}"
         download_successful=1
         break
       else
