@@ -1,0 +1,372 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# How a test run reports back, shared by both sites: a check on the commit that
+# was tested, and one table per pull request or issue saying what each
+# configuration last did.
+#
+# Called, never dispatched. The two comment workflows
+# (internal-test-hpe.yml, internal-test-alola.yml) call this; the manual ones
+# write their own status and no table, because a run started from the Actions
+# tab has no comment thread to hang one off.
+#
+# What is site-specific arrives as an input rather than being branched on here:
+# `marker` picks which comment is rewritten, `columns` and `key` the shape of
+# the table, so a site can add a field without touching this file and the rows
+# it has already collected stay where they are.
+#
+# Each caller grants this `statuses`, `issues` and `pull-requests` write: a
+# called workflow cannot widen what it was given.
+
+name: test (report)
+
+on:
+  workflow_call:
+    inputs:
+      # Identifies the site's sticky comment, and is the first line of it.
+      marker:
+        description: HTML comment that identifies this site's table
+        type: string
+        required: true
+      heading:
+        description: Heading rendered above the table
+        type: string
+        required: true
+      # A JSON array of field names, in the order they are rendered. Known
+      # names get a formatting of their own (see `cell` below); anything else
+      # renders as its plain value, so a new field costs a caller nothing.
+      columns:
+        description: JSON array of the row's fields to render, in order
+        type: string
+        required: true
+      # A JSON array of the field names that make two runs the same
+      # configuration. A field left out is not part of a configuration's
+      # identity.
+      key:
+        description: JSON array of the row's fields that identify a configuration
+        type: string
+        required: true
+      # The line between the heading and the table. An input because what a
+      # stale row means depends on what the table hangs off: a pull request has
+      # a head, and an issue tracking a release has a branch per row.
+      note:
+        description: The sentence under the heading
+        type: string
+        required: false
+        default: >-
+          One row per configuration, carrying its latest run. A commit that is
+          not the head is a configuration this pull request has not been
+          through since.
+
+      # The result being reported.
+      result:
+        description: Result of the build job, as GitHub spells it
+        type: string
+        required: true
+      sha:
+        description: The commit the check is written on
+        type: string
+        required: true
+      # What was asked for, where the commit above is what it resolved to. A
+      # pull request run leaves it empty: the head is the only thing it can
+      # mean, and a column of one repeated value is not worth its width.
+      ref:
+        description: The ref the run was asked for. Empty when the head of a pull request was
+        type: string
+        required: false
+        default: ""
+      status:
+        # Built by the dispatch job and passed through both here and to the
+        # pending status, because a context that differed between the two would
+        # leave two entries in the checks list instead of updating one.
+        description: Status context describing the configuration
+        type: string
+        required: true
+      activity:
+        # The check's description reads "<activity> <result>".
+        description: What the run did, for the commit status description
+        type: string
+        required: false
+        default: build and test
+
+      # The configuration, one input per field.
+      rocm:
+        description: The ROCm specifier that was asked for
+        type: string
+        required: true
+      installed:
+        description: The ROCm version the installation reported. Empty when it never got that far
+        type: string
+        required: false
+        default: ""
+      # Part of every configuration's identity even at the site that has one
+      # card: it is what the device code was compiled for, not just what it ran
+      # on, so two architectures are two builds.
+      arch:
+        description: The GPU architecture the run compiled and tested for
+        type: string
+        required: true
+      flags:
+        description: Extra cmake flags the run configured with. Empty for a default build
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  report:
+    name: the commit status and the table
+    # Self-hosted because the organization's IP allow list rejects a hosted
+    # runner's egress address for the API. Unlabelled: this only talks to it.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      issues: write
+      pull-requests: write
+    # One writer at a time per table. Several configurations finish in clumps,
+    # and the read-modify-write below is where two of them lose each other's
+    # rows; a group turns that race into a queue. Not cancelling, because the
+    # run that would be cancelled is the one carrying a result.
+    #
+    # The retry below stays as the backstop: this only orders the jobs a group
+    # can see, and the two sites' tables live under different markers on the
+    # same comment thread.
+    concurrency:
+      group: test-report-${{ inputs.marker }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+
+    steps:
+      # An issue_comment run attaches its checks to the default branch, so
+      # without this the pull request shows nothing at all. Two reports, which
+      # answer different questions: the check says what was run against this
+      # commit, the table says what each configuration last did and which commit
+      # that was, so a row still pointing at an older commit is the visible
+      # reminder that the head has not been through it.
+      - name: Report the result on the commit and in the table
+        uses: actions/github-script@v9
+        env:
+          MARKER: ${{ inputs.marker }}
+          HEADING: ${{ inputs.heading }}
+          NOTE: ${{ inputs.note }}
+          COLUMNS: ${{ inputs.columns }}
+          KEY: ${{ inputs.key }}
+          RESULT: ${{ inputs.result }}
+          SHA: ${{ inputs.sha }}
+          REF: ${{ inputs.ref }}
+          STATUS: ${{ inputs.status }}
+          ROCM: ${{ inputs.rocm }}
+          INSTALLED: ${{ inputs.installed }}
+          ARCH: ${{ inputs.arch }}
+          FLAGS: ${{ inputs.flags }}
+          ACTIVITY: ${{ inputs.activity }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const {
+              MARKER, HEADING, NOTE, RESULT, SHA, REF, STATUS, ROCM,
+              INSTALLED, ARCH, FLAGS, ACTIVITY,
+            } = process.env;
+            const columns = JSON.parse(process.env.COLUMNS);
+            const keyFields = JSON.parse(process.env.KEY);
+            const state = { success: 'success', cancelled: 'error' }[RESULT] ?? 'failure';
+            const server = `${context.serverUrl}/${owner}/${repo}`;
+            const url = `${server}/actions/runs/${context.runId}`;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: SHA,
+              state,
+              context: STATUS,
+              description: `${ACTIVITY} ${RESULT}`,
+              target_url: url,
+            });
+
+            // One comment per pull request and site, rewritten in place, rather
+            // than one per run -- which would have a pull request collect a
+            // comment for every configuration anybody tried. The rendered table
+            // is for reading; the rows are read back out of the payload under
+            // it, so nothing has to parse markdown. Editing sends no
+            // notification, so a failure now reaches you through its red check
+            // rather than the inbox.
+            const OPEN = '<!-- test-rows';
+            const CLOSE = '-->';
+            // GitHub rejects a comment body over 65536 characters. What that
+            // is in rows depends on the schema the caller asked for and on the
+            // payload under the table, which costs about as much again, so the
+            // only honest measure is the body that would be posted -- see the
+            // trim below. The kilobyte of headroom covers the gap between
+            // JavaScript's UTF-16 length and the UTF-8 bytes the API counts,
+            // which the emoji in the result column make more than theoretical.
+            const BUDGET = 64 * 1024;
+
+            // A row is a configuration, not a run. The commit and the version
+            // that was installed are results, so running a configuration again
+            // replaces its row wherever the pull request has moved to since --
+            // the table states what each configuration last did, and a
+            // superseded result survives in the check on the commit it ran
+            // against and in its own Actions run.
+            //
+            // A row written before a field existed does not carry it, which
+            // joins as the empty string and so still matches a run that has
+            // nothing there either.
+            const key = (r) => keyFields.map((f) => r[f] || '').join('|');
+            const row = {
+              result: RESULT, sha: SHA, ref: REF || '', rocm: ROCM,
+              installed: INSTALLED || '', arch: ARCH, flags: FLAGS || '',
+              run: String(context.runId), at: new Date().toISOString(),
+            };
+
+            const rowsOf = (body) => {
+              const start = (body || '').indexOf(OPEN);
+              if (start < 0) return [];
+              const end = body.indexOf(CLOSE, start + OPEN.length);
+              if (end < 0) return [];
+              try {
+                const rows = JSON.parse(body.slice(start + OPEN.length, end));
+                // A hand-edited or truncated payload costs the history, not the
+                // run: reporting must not be what fails a build. The commit is
+                // what every row has and every renderer below needs.
+                if (!Array.isArray(rows)) return [];
+                return rows.filter((r) => r && r.sha);
+              } catch {
+                return [];
+              }
+            };
+
+            // The columns that are not simply a value: a commit and a run are
+            // links, a specifier and a version are code.
+            const label = { sha: 'commit', at: 'finished' };
+            const cell = (r, field) => {
+              switch (field) {
+                // Emoji is all the colour a table cell can carry: markdown has
+                // no span to set one on, and a badge image would send every
+                // reader of every table through a service outside the
+                // organization. Failure takes the weight as well, because it
+                // is the one value a table of results is scanned for, and an
+                // unknown state is left as the word rather than given an emoji
+                // that would suggest this workflow understood it.
+                case 'result':
+                  return {
+                    success: '✅ success',
+                    failure: '❌ **failure**',
+                    cancelled: '🚫 cancelled',
+                    skipped: '⏭️ skipped',
+                  }[r.result] ?? r.result;
+                case 'sha':
+                  return `[\`${r.sha.slice(0, 7)}\`](${server}/commit/${r.sha})`;
+                // What was asked for, linked to what it points at now: a row
+                // whose commit is not that is a branch that has moved since.
+                // A run pinned to a commit is filed under it, so the link is
+                // to the same place the commit column goes.
+                case 'ref':
+                  return r.ref ? `[\`${r.ref}\`](${server}/tree/${r.ref})` : '—';
+                case 'rocm':
+                  return `\`${r.rocm}\``;
+                case 'installed':
+                  return r.installed ? `\`${r.installed}\`` : '—';
+                case 'arch':
+                  return `\`${r.arch}\``;
+                // The configure line the run added to the default one. Rendered
+                // as code in one cell rather than broken into a column per
+                // option, because the grammar does not know what is in it.
+                case 'flags':
+                  return r.flags ? `\`${r.flags}\`` : '—';
+                case 'run':
+                  return `[log](${server}/actions/runs/${r.run})`;
+                case 'at':
+                  return `${r.at.slice(0, 16).replace('T', ' ')} UTC`;
+                default:
+                  return r[field] ?? '';
+              }
+            };
+
+            const render = (rows) => [
+              MARKER,
+              `### ${HEADING}`,
+              '',
+              NOTE,
+              '',
+              `| ${columns.map((f) => label[f] || f).join(' | ')} |`,
+              `| ${columns.map(() => '---').join(' | ')} |`,
+              ...rows.map((r) => `| ${columns.map((f) => cell(r, f)).join(' | ')} |`),
+              '',
+              OPEN,
+              JSON.stringify(rows),
+              CLOSE,
+            ].join('\n');
+
+            // Runs do not take turns, so two report jobs can write between
+            // each other's read and write. Whoever loses notices that its row
+            // is gone and starts again from what the winner left behind.
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: context.issue.number, per_page: 100,
+              });
+              // The marker identifies the comment, and the author keeps a human
+              // who quoted it from being rewritten -- which the API would
+              // refuse anyway.
+              const [sticky, ...surplus] = comments.filter(
+                (c) => c.user?.type === 'Bot' && (c.body || '').startsWith(MARKER));
+
+              // Two jobs that both found none each created one. Keep the older,
+              // carry over what the others recorded, and drop them.
+              const carried = surplus.flatMap((c) => rowsOf(c.body));
+              const kept = [...rowsOf(sticky ? sticky.body : ''), ...carried]
+                .filter((r) => key(r) !== key(row));
+
+              // Drop the oldest row until what would be posted fits. The new
+              // row is never the one dropped: this run is why the comment is
+              // being written. At a few hundred characters a row across the
+              // table and the payload, that is some hundred configurations
+              // before anything falls off, and a configuration that does fall
+              // off keeps its check on its commit and its own Actions run.
+              let keep = [row, ...kept];
+              let body = render(keep);
+              while (body.length > BUDGET && keep.length > 1) {
+                keep = keep.slice(0, -1);
+                body = render(keep);
+              }
+
+              const written = sticky
+                ? (await github.rest.issues.updateComment({
+                  owner, repo, comment_id: sticky.id, body,
+                })).data
+                : (await github.rest.issues.createComment({
+                  owner, repo, issue_number: context.issue.number, body,
+                })).data;
+              for (const c of surplus) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+              }
+
+              const after = (await github.rest.issues.getComment({
+                owner, repo, comment_id: written.id,
+              })).data.body;
+              if (rowsOf(after).some((r) => key(r) === key(row) && r.run === row.run)) {
+                return;
+              }
+              core.info(`the table was written over on attempt ${attempt}; retrying`);
+            }
+
+            // The check on the commit and the run's own step summary still say
+            // what happened, which is why this is a warning and not a failure.
+            core.warning(`could not record this run in the ${HEADING} table`);

@@ -1,0 +1,398 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# `/test alola` on a pull request or an issue: parse the command, work out what
+# commit it means, and hand the rest to the shared run and report workflows.
+#
+# The hpe copy of this is internal-test-hpe.yml, and the two differ in what the
+# grammar accepts rather than in what they do with it: this site has many
+# cards, so `arch=` picks one and is part of what makes a configuration, and
+# `time=` bounds the batch job.
+#
+# An issue_comment event runs the copy of this file on the default branch, not
+# the one in the pull request, so a change to the grammar takes effect when it
+# merges and a pull request cannot alter how its own command is read.
+
+name: test (alola)
+
+on:
+  issue_comment:
+    types: [created]
+
+# No concurrency group, for the reason internal-test-hpe.yml gives: with
+# several configurations to get through, one command cancelling the run before
+# it is the wrong trade. The cluster has many cards, so runs here do not even
+# queue behind each other the way the single hpe machine's do.
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: dispatch
+    # Authorization comes from the event payload, so an unauthorized comment
+    # never reaches a runner. Every comment in the repository starts a run of
+    # this workflow, and all but these end here, having allocated nothing.
+    #
+    # The more specific prefix: `/test` and `/test hpe` are the other site's
+    # command and belong to internal-test-hpe.yml, which excludes this one.
+    if: >-
+      github.repository_owner == 'AMD-AIOSS'
+      && startsWith(github.event.comment.body, '/test alola')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                  github.event.comment.author_association)
+    # Self-hosted because the organization's IP allow list rejects a hosted
+    # runner's egress address for the API, but unlabelled: this job only talks
+    # to the API, and in particular it is not the alola bridge.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      contents: read # expand a short sha
+      pull-requests: write # react to the triggering comment, resolve the head sha
+      issues: write # the same reaction, on a comment to a plain issue
+      statuses: write # report "pending" on the commit
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      ref: ${{ steps.parse.outputs.ref }}
+      rocm: ${{ steps.parse.outputs.rocm }}
+      arch: ${{ steps.parse.outputs.arch }}
+      time: ${{ steps.parse.outputs.time }}
+      flags: ${{ steps.parse.outputs.flags }}
+      status: ${{ steps.parse.outputs.status }}
+      columns: ${{ steps.parse.outputs.columns }}
+      key: ${{ steps.parse.outputs.key }}
+      note: ${{ steps.parse.outputs.note }}
+
+    steps:
+      # /test alola [ref=<branch|tag>] [sha=<7-40 hex>] [rocm=<specifier>]
+      #             [arch=<card>] [time=<2h>] [-- <cmake flags>]
+      - name: Parse the command
+        id: parse
+        env:
+          # Through the environment, never interpolated into the script body: a
+          # comment is untrusted text and ${{ }} inside `run` is an injection.
+          BODY: ${{ github.event.comment.body }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+        run: |
+          # -f because the loops below split the comment into words, and a body
+          # containing `*` would otherwise be expanded against the filesystem.
+          set -euf
+
+          # First line only, so a reply that quotes someone else's command
+          # cannot smuggle options past the allowlist below.
+          line=${BODY%%$'\n'*}
+          line=${line%$'\r'}
+
+          rocm=therock:7.14.0
+          sha=
+          ref=
+          # The card this site is usually asked for. Unlike hpe, where the one
+          # machine's architecture is a constant of the workflow, this is part
+          # of the configuration: it is what the device code gets compiled for.
+          arch=mi300x
+          # What the batch job gets once it has a card, as against the job's own
+          # timeout-minutes, which bounds the wait for one.
+          time=2h
+
+          # Everything after the first ` -- ` is handed to cmake as it stands.
+          # See internal-test-hpe.yml for why this is a sentinel rather than an
+          # option. Taken before the prefix is stripped, so the options and the
+          # flags are parsed from their own halves of the line.
+          flags=
+          case "${line}" in
+            *" -- "*)
+              flags=${line#* -- }
+              line=${line%% -- *} ;;
+          esac
+
+          # Normalised through the same word splitting build.sh will do, so
+          # that two spellings of one flag set are one configuration with one
+          # check and one row rather than two. Positional parameters are used
+          # again below, so this has to come first.
+          set -- ${flags}
+          flags="$*"
+
+          # An allowlist, because this is the one part of the command that is
+          # not matched against a pattern of its own. `;` stays in: it is
+          # cmake's list separator. What is kept out is everything a shell would
+          # find interesting, so that a flag string cannot become one.
+          case "${flags}" in
+            *[!-A-Za-z0-9_=+.,:\;/\ ]*)
+              echo "::error::the flags after '--' carry a character outside -A-Za-z0-9_=+.,:;/ and space; a cmake list value is semicolon separated and needs no quoting"
+              exit 1 ;;
+          esac
+
+          # The `if:` above matched `/test alola` as a prefix, so
+          # `/test alolaX` arrives here. Saying what the command is beats
+          # reporting its first word as an unknown option.
+          rest=${line#*/test alola}
+          case "${rest}" in
+            ''|[[:space:]]*) ;;
+            *)
+              echo "::error::'${line}' is not the /test alola command"
+              exit 1 ;;
+          esac
+
+          for tok in ${rest}; do
+            case "${tok}" in
+              # The cards, as case globs because each is a fixed word. The same
+              # names internal-test-alola-run.yml maps to a ROCm architecture;
+              # keep the two in step. Listed rather than pattern-matched so that
+              # `arch=mi300` is a parse error here, in a job that costs
+              # nothing, rather than a rejection from the login node two
+              # minutes into a run.
+              arch=mi300x|arch=mi300a|arch=mi308x|arch=mi325x)
+                arch=${tok#arch=} ;;
+              arch=mi350x|arch=mi355x)
+                arch=${tok#arch=} ;;
+              arch=mi210|arch=mi210x|arch=mi250)
+                arch=${tok#arch=} ;;
+              *)
+                # Anchored regexes rather than case globs for the rest: two end
+                # up in a git ref and one drives an install.
+                #
+                # The rocm pattern is the ROCM_SPECIFIER grammar of
+                # ci/internal/librocm.sh, minus the two forms that need the
+                # Jenkins nodes. Repeated here because this job has no checkout
+                # to source the library from.
+                # The `?` spellings of the three wildcards are here because a
+                # comment is rendered markdown: `*a*` is emphasis, so the text
+                # a reader sees is not the specifier that ran. They are passed
+                # on as typed; librocm.sh rewrites them to the `*` forms.
+                if [[ ${tok} =~ ^rocm=(preinstalled|[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]{1,2})?|therock:(\*|\*(a|rc)\*|\?|\?(a|rc)\?|[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}((a|rc)[0-9]{1,8})?))$ ]]; then
+                  rocm=${tok#rocm=}
+                elif [[ ${tok} =~ ^sha=[0-9a-fA-F]{7,40}$ ]]; then
+                  sha=${tok#sha=}
+                elif [[ ${tok} =~ ^ref=[A-Za-z0-9._/-]{1,100}$ ]]; then
+                  ref=${tok#ref=}
+                # A canonical GRES name, which the run workflow reduces to the
+                # architecture in front of the model. Shaped rather than listed,
+                # because the cluster is the authority on which of these exist;
+                # the shape is asked for so that `arch=gfx11oo` is a parse error
+                # here rather than a rejection from the login node.
+                elif [[ ${tok} =~ ^arch=gfx[0-9a-f]{3,4}[a-z]?(-[a-z0-9]{2,10})?$ ]]; then
+                  arch=${tok#arch=}
+                # SLURM's own spellings: 2h, 90m, 1h30m, 02:00:00.
+                elif [[ ${tok} =~ ^time=([0-9]{1,2}h([0-9]{1,2}m)?|[0-9]{1,4}m|[0-9]{1,2}:[0-9]{2}:[0-9]{2})$ ]]; then
+                  time=${tok#time=}
+                # A card that is neither in the list above nor shaped like a
+                # gfx name. Answered on its own, because "unknown option" for
+                # something that plainly is the arch option reads as a bug in
+                # the grammar rather than a typo in the card.
+                elif [[ ${tok} =~ ^arch= ]]; then
+                  echo "::error::unknown arch '${tok#arch=}'; the cards this workflow knows are mi300x mi300a mi308x mi325x mi350x mi355x mi210 mi250, or a gfx name such as gfx942-mi300x, gfx1100p or gfx1151"
+                  exit 1
+                else
+                  # Failing beats silently running the default configuration,
+                  # which is what a typo would otherwise do.
+                  echo "::error::unknown /test alola option '${tok}'; the options are ref=, sha=, rocm=, arch= and time=, and extra cmake flags go after ' -- '"
+                  exit 1
+                fi ;;
+            esac
+          done
+
+          # Both name what to test, and the answers can differ. Rather than
+          # pick one, say so: `ref=` follows a branch, `sha=` pins a commit.
+          if [[ -n ${ref} && -n ${sha} ]]; then
+            echo "::error::ref=${ref} and sha=${sha} both say what to test; keep the one you meant -- ref= follows a branch, sha= pins a commit"
+            exit 1
+          fi
+
+          # On a pull request, no ref means the head. On an issue there is no
+          # head to mean, and the command has to be told.
+          if [[ ${IS_PR} != true && -z ${ref} && -z ${sha} ]]; then
+            echo "::error::this comment is on an issue, not a pull request, so there is no head to test; name what to test with ref=<branch> (or sha=<commit>)"
+            exit 1
+          fi
+
+          # One check per configuration. The statuses API keys a status by
+          # commit and context, so a context shared by every run would have each
+          # run overwrite the one before it. Built here, once, and reused by the
+          # report job: a context that differed between the pending status and
+          # the final one would leave two lines instead of updating one.
+          #
+          # The site and the card are both in there: hpe tests the same
+          # specifiers on its own machine, and this site tests them on several.
+          # `time` is not -- a wall clock is how long the run was allowed, not
+          # what it tested, and two runs that differ only in it are the same
+          # configuration.
+          status="test alola (${rocm}, ${arch}"
+          # An if rather than `[[ ... ]] &&`, which under `set -e` would exit
+          # the step the moment the condition did not hold.
+          if [[ -n ${flags} ]]; then
+            status="${status}, flags ${flags}"
+          fi
+          status="${status})"
+
+          # What the table looks like, which depends on what the command was
+          # run from. A pull request tests its own head and nothing else, so a
+          # ref column would repeat one value down every row. An issue is the
+          # other case, so the ref becomes a column and the first field of what
+          # makes two runs the same configuration.
+          #
+          # `arch` is a column here where the hpe table leaves it out: this site
+          # has many cards, so it is the column that table is read for.
+          if [[ ${IS_PR} == true ]]; then
+            columns='["result", "sha", "rocm", "installed", "arch", "flags", "run", "at"]'
+            key='["rocm", "arch", "flags"]'
+            note='One row per configuration, carrying its latest run. A commit that is not the head is a configuration this pull request has not been through since.'
+          else
+            columns='["result", "ref", "sha", "rocm", "installed", "arch", "flags", "run", "at"]'
+            key='["ref", "rocm", "arch", "flags"]'
+            note='One row per ref and configuration, carrying its latest run. A commit that is not the tip of its ref is a configuration that branch has not been through since.'
+          fi
+
+          # What was named, which is what the row is filed under. A pinned
+          # commit stands in for a ref it was not given: two runs against two
+          # commits of the same branch are two answers about that release task,
+          # and a shared empty ref would file them as one.
+          named=${ref:-${sha}}
+
+          # The allowlist above is also what keeps a crafted comment from
+          # injecting extra keys here: none of these can contain a newline.
+          {
+            echo "rocm=${rocm}"
+            echo "arch=${arch}"
+            echo "time=${time}"
+            echo "flags=${flags}"
+            echo "ref=${named}"
+            echo "status=${status}"
+            echo "columns=${columns}"
+            echo "key=${key}"
+            echo "note=${note}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Resolve the commit and acknowledge the command
+        id: resolve
+        uses: actions/github-script@v9
+        env:
+          # Whichever of `sha=` and `ref=` was given, already refused as a
+          # pair by the parse step: one string for one lookup.
+          REQUESTED: ${{ steps.parse.outputs.ref }}
+          STATUS: ${{ steps.parse.outputs.status }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const requested = process.env.REQUESTED;
+            let sha;
+            if (requested) {
+              // One call for both spellings: getCommit resolves a branch, a
+              // tag or a short sha, and answers with the full forty characters
+              // a commit status has to name. Resolved now, so a push between
+              // the comment and the build does not change what was tested;
+              // `sha=` is how to pin it against the branch moving under a
+              // queue, which on this site can be a long one.
+              sha = (await github.rest.repos.getCommit(
+                { owner, repo, ref: requested })).data.sha;
+            } else {
+              // No ref, so the pull request's head is what was meant. The
+              // parse step has already refused this on an issue, where
+              // context.issue.number is not a pull request to read.
+              sha = (await github.rest.pulls.get(
+                { owner, repo, pull_number: context.issue.number })).data.head.sha;
+            }
+            core.setOutput('sha', sha);
+
+            await github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content: 'eyes',
+            });
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              state: 'pending',
+              context: process.env.STATUS,
+              description: 'queued for a card on alola',
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+
+      # A parameterized run is not reproducible from the comment thread unless
+      # the parameters are written down somewhere.
+      - name: Record the resolved parameters
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+          REF: ${{ steps.parse.outputs.ref }}
+          ROCM: ${{ steps.parse.outputs.rocm }}
+          ARCH: ${{ steps.parse.outputs.arch }}
+          TIME: ${{ steps.parse.outputs.time }}
+          FLAGS: ${{ steps.parse.outputs.flags }}
+        run: |
+          {
+            echo "### test (alola)"
+            echo
+            if [ -n "${REF}" ]; then
+              echo "- ref: \`${REF}\`"
+            fi
+            echo "- commit: \`${SHA}\`"
+            echo "- gpu: ${ARCH}"
+            echo "- rocm: \`${ROCM}\`"
+            echo "- wall clock: \`${TIME}\`"
+            echo "- cmake flags: ${FLAGS:+\`${FLAGS}\`}${FLAGS:-none}"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+  # The parsed comment, handed to the shared run. `sha` rather than the pull
+  # request's branch, so a push between the comment and the build cannot change
+  # what is tested, and no secrets are passed: the job that compiles this code
+  # gets the read-only token below and nothing else.
+  build-and-test:
+    needs: dispatch
+    permissions:
+      contents: read
+    uses: ./.github/workflows/internal-test-alola-run.yml
+    with:
+      ref: ${{ needs.dispatch.outputs.sha }}
+      rocm: ${{ needs.dispatch.outputs.rocm }}
+      arch: ${{ needs.dispatch.outputs.arch }}
+      time: ${{ needs.dispatch.outputs.time }}
+      flags: ${{ needs.dispatch.outputs.flags }}
+
+  # The check on the commit and this site's table, written by the workflow both
+  # sites share. What is site-specific is which comment it writes into: a
+  # separate marker, so the two tables sit side by side on the same thread
+  # rather than overwriting each other.
+  report:
+    name: report
+    # Runs whatever the build did, but not when the command itself was rejected:
+    # a parse error has no commit to report against.
+    if: always() && needs.dispatch.result == 'success'
+    needs: [dispatch, build-and-test]
+    permissions:
+      statuses: write
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/internal-test-report.yml
+    with:
+      marker: <!-- test-alola-overview -->
+      heading: test (alola)
+      columns: ${{ needs.dispatch.outputs.columns }}
+      key: ${{ needs.dispatch.outputs.key }}
+      note: ${{ needs.dispatch.outputs.note }}
+      result: ${{ needs.build-and-test.result }}
+      sha: ${{ needs.dispatch.outputs.sha }}
+      ref: ${{ needs.dispatch.outputs.ref }}
+      status: ${{ needs.dispatch.outputs.status }}
+      rocm: ${{ needs.dispatch.outputs.rocm }}
+      installed: ${{ needs.build-and-test.outputs.rocm_version }}
+      # The ROCm architecture the run derived, not the SLURM variant that was
+      # asked for: what the device code was compiled for is what comparing two
+      # rows is about. Falls back to the variant when the run never started,
+      # because the report still has a row to file.
+      arch: ${{ needs.build-and-test.outputs.arch || needs.dispatch.outputs.arch }}
+      flags: ${{ needs.dispatch.outputs.flags }}

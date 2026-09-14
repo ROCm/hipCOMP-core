@@ -1,0 +1,273 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The work of a test on hpe, with no trigger of its own: install the requested
+# ROCm, build the library and its tests, and run the CTest suite on the MI210
+# machine we own. Nothing here reimplements the build -- the four ci/internal
+# scripts are what Jenkins drives too, so a green run here means the same thing
+# a green builder-tester pair does.
+#
+# Called, never dispatched. `workflow_call` does not put a workflow in the
+# Actions tab, so the two ways to start one of these are internal-test-hpe.yml
+# (a `/test hpe` comment on a pull request) and internal-test-hpe-manual.yml
+# (the Actions tab). Everything either of them decides arrives here as an
+# input, which is what lets one job serve both.
+#
+# The other site's copy of this is internal-test-alola-run.yml, which runs the
+# same scripts with the same inputs as a SLURM batch job.
+#
+# The container is a stock manylinux image and
+# ci/internal/prepare-container.sh installs the requested ROCm into it. That
+# lets a caller name any ROCm the specifier grammar allows instead of only the
+# versions that have a prebuilt image, and it is the same image the
+# aisw-ci-builder-tester builder for this component is based on.
+#
+# This job compiles and executes the code at `ref` on a machine with a GPU, so
+# it takes no secrets and asks for nothing but a read-only token. Both callers
+# grant it `contents: read` and nothing else; a called workflow cannot widen
+# what it was granted.
+
+name: test (hpe, run)
+
+on:
+  workflow_call:
+    inputs:
+      # A branch, tag or sha. The comment path always passes a full sha, the
+      # manual path passes whatever it was given, so the commit that was
+      # actually built is read back after the checkout rather than assumed.
+      ref:
+        description: What to build and test
+        type: string
+        required: true
+      rocm:
+        description: ROCM_SPECIFIER for ci/internal/librocm.sh
+        type: string
+        required: true
+      # Appended to the configure line by ci/internal/build.sh, after the -D
+      # flags it sets itself, so this can override any of them.
+      flags:
+        description: Extra cmake flags, whitespace separated. Empty is a default build
+        type: string
+        required: false
+        default: ""
+    outputs:
+      sha:
+        # `ref` may be a branch, while a commit status and the artifact name
+        # both need the forty characters. Reported even when the build fails,
+        # so a caller can still say what it was that failed.
+        description: The commit that was checked out
+        value: ${{ jobs.build-and-test.outputs.sha }}
+      rocm_version:
+        # `rocm` is a specifier, not a version: a wildcard has no version in it
+        # at all and even an exact one can unpack a tarball with a different
+        # patch level. This is what the installation reported, so a caller can
+        # say what was actually tested rather than what was asked for. Empty
+        # when the run failed before ROCm was installed.
+        description: The ROCm version the installation reported
+        value: ${{ jobs.build-and-test.outputs.rocm_version }}
+      arch:
+        # Fixed at this site, but emitted rather than restated by each caller so
+        # that the machine's architecture is written down once.
+        description: The GPU architecture the run compiled and tested for
+        value: ${{ jobs.build-and-test.outputs.arch }}
+
+permissions: {}
+
+jobs:
+  build-and-test:
+    name: build and test (rocm ${{ inputs.rocm }}, mi210)
+    # The architecture is not an input: this site is one machine, and asking for
+    # its only card was a way to mistype a runner label. gfx90a here rather than
+    # mi210 because that is what the machine is labelled with -- relabelling it
+    # is the one thing that changes this line.
+    runs-on: [self-hosted, linux, gfx90a]
+    # The build compiles device code for one architecture and the suite is some
+    # twenty executables with no fast/slow split, several of which run to tens
+    # of millions of elements.
+    timeout-minutes: 240
+    # The only job that touches the code under test, and all it may do is read
+    # it.
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      rocm_version: ${{ steps.resolved.outputs.rocm_version }}
+      arch: ${{ steps.resolved.outputs.arch }}
+    container:
+      # The image the AlmaLinux builder for this component is based on. ROCm is
+      # not in it; the prepare step below installs the requested one.
+      image: quay.io/pypa/manylinux_2_28_x86_64
+      # The device mapping the Jenkins node uses for this machine. Its
+      # --network=host is absent because container.options does not accept it.
+      options: >-
+        --device=/dev/kfd --device=/dev/dri
+        --group-add video --group-add render
+        --ipc=host --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      # ci/internal/build.sh resolves the checkout as ${SRC_DIR}/${PROJECT_ID},
+      # which is why the checkout lands in a directory of that exact name, and
+      # ci/internal/test.sh finds the build tree the same way.
+      SRC_DIR: ${{ github.workspace }}
+      BUILD_DIR: ${{ github.workspace }}/build
+      INSTALL_DIR: ${{ github.workspace }}/install
+      BUILD_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+      PROJECT_ID: hipcomp_core
+      ROCM_PATH: /opt/rocm
+      # Read by prepare-container.sh. ROCM_VERSION is not set here on purpose:
+      # that script reads it back from the installation and exports it.
+      ROCM_SPECIFIER: ${{ inputs.rocm }}
+      # The architecture the machine above carries. It is not only what selects
+      # the ROCm distribution that gets downloaded (gfx90a -> the gfx90X-dcgpu
+      # tarball): build.sh also forwards it to CMAKE_HIP_ARCHITECTURES and
+      # GPU_TARGETS, so it is what the device code is compiled for.
+      AMDGPU_TARGETS: gfx90a
+      # The distro python3 of this image is 3.6, which current cmake wheels do
+      # not support, and build.sh builds its cmake venv with `python3 -m venv`.
+      MANYLINUX_DEFAULT_PYTHON_VERSION: "3.12"
+      # A test run, so no `cmake --install` and no tests tarball: the tarball is
+      # for handing a build to a separate tester image, and here the suite runs
+      # in the job that built it.
+      HIPCOMP_CORE_BUILD_TYPE: build
+      HIPCOMP_CORE_CMAKE_ARGS: ${{ inputs.flags }}
+      CMAKE_BUILD_PARALLEL_LEVEL: "16"
+      HIP_VISIBLE_DEVICES: "0"
+
+    steps:
+      # The comment grammar checks this while parsing, so this is here for the
+      # manual caller, whose free-text field cannot. Not a security boundary --
+      # the value reaches the build through the environment and never through a
+      # shell or an expression, and anyone who can dispatch this can push a
+      # commit anyway -- but a flag string carrying a quote or a backtick means
+      # the caller expected a shell to be involved, and failing now says so
+      # rather than letting cmake fail on a mangled argument an hour in.
+      - name: Validate the extra cmake flags
+        if: inputs.flags != ''
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          set -eu
+          case "${FLAGS}" in
+            *[!-A-Za-z0-9_=+.,:\;/\ ]*)
+              echo "::error::flags='${FLAGS}' carries a character outside -A-Za-z0-9_=+.,:;/ and space; a cmake list value is semicolon separated and needs no quoting"
+              exit 1 ;;
+          esac
+
+      # First, because everything below runs the checked-out copy of the
+      # ci/internal scripts. The manylinux image ships git, so there is nothing
+      # to install before this and no tarball fallback to worry about.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: hipcomp_core
+
+      # What `ref` resolved to. A branch name moves, and both the artifact name
+      # and the commit status a caller writes have to name a commit.
+      - name: Record the commit under test
+        id: commit
+        run: echo "sha=$(git -C hipcomp_core rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
+      # The scripts that run are the ones at `ref`, and these three arrived with
+      # this workflow. Without them the job would claim the machine and fail
+      # with "no such file" a minute later; naming the missing script and where
+      # it lives takes ten seconds.
+      - name: Check that this commit carries the container scripts
+        run: |
+          set -eu
+          for script in prepare-container.sh librocm.sh libos.sh prepare.sh build.sh test.sh; do
+            if [ ! -f "hipcomp_core/ci/internal/${script}" ]; then
+              echo "::error::this commit has no ci/internal/${script}; a test run needs the container scripts, which are on amd-integration and its descendants"
+              exit 1
+            fi
+          done
+
+      # A commit that predates HIPCOMP_CORE_CMAKE_ARGS would configure without
+      # the flags that were asked for and report a pass for a build nobody
+      # requested, which is worse than refusing.
+      - name: Check that this commit understands the extra cmake flags
+        if: inputs.flags != ''
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          set -eu
+          if ! grep -q HIPCOMP_CORE_CMAKE_ARGS hipcomp_core/ci/internal/build.sh; then
+            echo "::error::this commit carries a build.sh that ignores HIPCOMP_CORE_CMAKE_ARGS; flags='${FLAGS}' would have no effect until that change is on the branch"
+            exit 1
+          fi
+
+      # These outlive a job on a self-hosted runner, and build.sh globs nothing
+      # but a stale package left in BUILD_ARTIFACTS_DIR would be uploaded as if
+      # this run had produced it.
+      - name: Clean the scratch directories
+        run: |
+          set -eu
+          rm -rf "${BUILD_DIR}" "${INSTALL_DIR}" "${BUILD_ARTIFACTS_DIR}"
+          mkdir -p "${BUILD_DIR}" "${INSTALL_DIR}" "${BUILD_ARTIFACTS_DIR}"
+
+      # Installs ROCm and exports the ROCm and HIP environment for the steps
+      # below. A job container is destroyed when the job ends, so this runs from
+      # scratch every time.
+      - name: Install ROCm and select the interpreter
+        run: bash hipcomp_core/ci/internal/prepare-container.sh
+
+      # The version above is read back out of rocm_version.h rather than taken
+      # from the specifier, but it never left the job. Lifting it into an output
+      # is what lets a caller report the ROCm that was installed instead of the
+      # specifier that asked for it.
+      #
+      # Skipped entirely when the install failed, which the caller has to
+      # tolerate.
+      - name: Report the installed ROCm version and target
+        id: resolved
+        run: |
+          {
+            echo "rocm_version=${ROCM_VERSION:-}"
+            echo "arch=${AMDGPU_TARGETS}"
+          } >>"${GITHUB_OUTPUT}"
+
+      # After the ROCm install, not before: this decides whether to install the
+      # hipcub and rocthrust packages by looking for their headers under
+      # ${ROCM_PATH}, and a TheRock tarball carries both.
+      - name: Install the compression libraries and packaging backend
+        run: bash hipcomp_core/ci/internal/prepare.sh
+
+      # Cheap, and it turns a device-mapping mistake into an immediate answer
+      # rather than one that surfaces after an hour of compiling.
+      - name: Show the visible devices
+        run: rocm-smi
+
+      - name: Build the library, the tests and the packages
+        run: bash hipcomp_core/ci/internal/build.sh
+
+      - name: Run the CTest suite
+        run: bash hipcomp_core/ci/internal/test.sh
+
+      # What the build would have handed to a tester image or a release. Kept
+      # for a failed run too, because a package that was produced before the
+      # suite failed is still what one would want to look at.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: packages-${{ steps.commit.outputs.sha }}
+          path: |
+            artifacts/*.rpm
+            artifacts/*.deb
+          if-no-files-found: ignore

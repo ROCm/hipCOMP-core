@@ -1,0 +1,187 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The Actions-tab way into a test on alola. The run is the same one a
+# `/test alola` comment produces -- both callers hand the same values to
+# internal-test-alola-run.yml -- so this file is only the parameter form and
+# the commit status.
+#
+# When to reach for this rather than the comment: to test a branch that has no
+# pull request, to sweep one commit across several cards without filling a
+# conversation with commands, or to point the batch job at another image.
+#
+# The `ref` input is what gets built, and it is not the branch chosen in the
+# UI's "Use workflow from" selector; that selector decides only which copy of
+# these workflow files runs.
+#
+# No author gate, unlike the comment path: dispatching a workflow already
+# requires write access, so the authorization the comment path has to check for
+# itself is GitHub's own here.
+
+name: test (alola, manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: What to build and test. A branch, tag, sha, or refs/pull/<n>/head
+        type: string
+        required: true
+        default: amd-integration
+      # The cards internal-test-alola-run.yml maps to a ROCm architecture. A
+      # dropdown rather than the comment grammar's free text plus allowlist,
+      # which is the one thing a form does better; a card outside this list can
+      # still be reached by its GRES name from a comment.
+      arch:
+        description: GPU variant to allocate
+        type: choice
+        options: [mi300x, mi300a, mi308x, mi325x, mi350x, mi355x, mi210, mi250]
+        default: mi300x
+      rocm:
+        description: "ROCm to install: therock:X.Y.Z, X.Y.Z, therock:* (or ?), therock:*rc* (or ?rc?), therock:*a* (or ?a?) or preinstalled"
+        type: string
+        default: therock:7.14.0
+      flags:
+        description: "Extra cmake flags, whitespace separated, e.g. -D HIPCOMP_ZSTD_KERNEL_VERSION=clean. Empty is a default build"
+        type: string
+        default: ""
+      time:
+        description: SLURM wall clock limit for the batch job, e.g. 2h, 90m, 02:00:00
+        type: string
+        default: 2h
+      image:
+        description: Container image for the batch job
+        type: string
+        default: quay.io/pypa/manylinux_2_28_x86_64
+
+# Per ref and card: this site has many cards, so two runs of one commit on two
+# of them are two different things and neither should cancel the other. The
+# comment path has no group at all; see internal-test-hpe-manual.yml for why a
+# dispatch keeps one.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}-${{ inputs.arch }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build-and-test:
+    if: github.repository_owner == 'AMD-AIOSS'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/internal-test-alola-run.yml
+    with:
+      ref: ${{ inputs.ref }}
+      rocm: ${{ inputs.rocm }}
+      arch: ${{ inputs.arch }}
+      time: ${{ inputs.time }}
+      image: ${{ inputs.image }}
+      flags: ${{ inputs.flags }}
+
+  report:
+    name: report
+    if: always() && github.repository_owner == 'AMD-AIOSS'
+    needs: build-and-test
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      contents: read # resolve the ref when the build did not get that far
+
+    steps:
+      # The same status context the comment path writes, on purpose: a manual
+      # run against a pull request head then updates the very check a reviewer
+      # is already looking at. That is only true while the two agree on how the
+      # context is spelled, so the format below mirrors the one the dispatch
+      # job of internal-test-alola.yml builds -- a workflow cannot read another
+      # workflow's step outputs, which is why it is written twice.
+      #
+      # There is no comment to leave -- a dispatch has no pull request in
+      # context -- so the status and the step summary are the whole report.
+      - uses: actions/github-script@v9
+        env:
+          RESULT: ${{ needs.build-and-test.result }}
+          SHA: ${{ needs.build-and-test.outputs.sha }}
+          INSTALLED: ${{ needs.build-and-test.outputs.rocm_version }}
+          TARGET: ${{ needs.build-and-test.outputs.arch }}
+          NODE: ${{ needs.build-and-test.outputs.node }}
+          REF: ${{ inputs.ref }}
+          ROCM: ${{ inputs.rocm }}
+          ARCH: ${{ inputs.arch }}
+          TIME: ${{ inputs.time }}
+          IMAGE: ${{ inputs.image }}
+          FLAGS: ${{ inputs.flags }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const {
+              RESULT, REF, ROCM, ARCH, TIME, IMAGE, INSTALLED, TARGET, NODE,
+            } = process.env;
+            // Through the same whitespace normalisation the comment path's
+            // parse step does, so that a form and a comment asking for the
+            // same flags write one check rather than two that differ by a
+            // space.
+            const flags = process.env.FLAGS.trim().split(/\s+/).filter(Boolean).join(' ');
+            const state = { success: 'success', cancelled: 'error' }[RESULT] ?? 'failure';
+            // The faces the table in internal-test-report.yml uses, so a result
+            // reads the same wherever it is reported.
+            const face = {
+              success: '✅', failure: '❌', cancelled: '🚫', skipped: '⏭️',
+            }[RESULT] ?? '';
+            const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            // The variant that was asked for, as the comment path's context
+            // carries it, and not the architecture the run derived from it:
+            // the two files have to agree, and only one of them runs early
+            // enough to know the request.
+            const status = `test alola (${ROCM}, ${ARCH}`
+              + (flags ? `, flags ${flags}` : '') + ')';
+
+            // The run reports what it checked out, which is the commit a status
+            // has to name. It is empty only when the build failed before the
+            // checkout, and a validation failure is still worth a status, so
+            // resolve the ref here in that case.
+            const sha = process.env.SHA
+              || (await github.rest.repos.getCommit({ owner, repo, ref: REF })).data.sha;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              state,
+              context: status,
+              description: `build and test ${RESULT}`,
+              target_url: url,
+            });
+
+            // A dispatched run is not reproducible from anywhere else: the
+            // parameters exist only in the form that was submitted.
+            await core.summary
+              .addHeading('test (alola, manual)', 3)
+              .addList([
+                `result: ${face ? `${face} ` : ''}${RESULT}`,
+                `ref: ${REF}`,
+                `commit: ${sha}`,
+                `gpu: ${ARCH}${TARGET ? ` (${TARGET})` : ''}${NODE ? ` on ${NODE}` : ''}`,
+                `rocm: ${ROCM}${INSTALLED ? ` (installed ${INSTALLED})` : ''}`,
+                `cmake flags: ${flags || 'none'}`,
+                `wall clock: ${TIME}`,
+                `image: ${IMAGE}`,
+              ])
+              .write();

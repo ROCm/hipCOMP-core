@@ -1,0 +1,371 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The work of a test on alola, with no trigger of its own: the same four
+# ci/internal scripts internal-test-hpe-run.yml runs, submitted to the cluster
+# as one SLURM batch job so that the run can ask for a card this organization
+# does not own a machine of.
+#
+# What differs from the hpe copy, and why this is a second file rather than an
+# input to the first:
+#
+#   - the runner is a login node with no GPU and no ROCm. It stages a workspace
+#     and hands a script to a compute node; everything that touches a card
+#     happens over there.
+#   - the compute node is meant to need nothing but a container registry, so
+#     the checkout happens here, on the bridge, and travels in the staged
+#     workspace.
+#   - there are no steps on the compute node, only one script. It gets no
+#     GITHUB_ENV to pass an environment along with, so where the hpe job has
+#     prepare-container.sh export into the steps that follow, this sources the
+#     file that script also writes.
+#   - `arch` is an input, because this site has many cards. It names a SLURM
+#     GPU variant, which is not the same namespace as a ROCm architecture; see
+#     the step that maps between them.
+#
+# Called, never dispatched: internal-test-alola.yml (a `/test alola` comment)
+# and internal-test-alola-manual.yml (the Actions tab) are the two ways in.
+#
+# This compiles and executes the code at `ref`, so it takes no secrets and asks
+# for nothing but a read-only token.
+
+name: test (alola, run)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: What to build and test
+        type: string
+        required: true
+      rocm:
+        description: ROCM_SPECIFIER for ci/internal/librocm.sh
+        type: string
+        required: true
+      # A SLURM GPU variant, not a ROCm architecture. The cluster checks it
+      # against its own gpu-variant-mappings.yaml, so an unknown card is
+      # refused there rather than guessed at here.
+      arch:
+        description: GPU variant to allocate, e.g. mi300x or gfx1151
+        type: string
+        required: true
+      # Bounds the batch job once it has started, where the job's own
+      # timeout-minutes bounds the wait for a card. The default is what a build
+      # and the full suite take with room to spare on a busy node; raise it
+      # with `time=` if a run is cut off rather than failing.
+      time:
+        description: SLURM wall clock limit for the batch job, e.g. 2h
+        type: string
+        required: false
+        default: 2h
+      # The same image the hpe job uses and the AlmaLinux builder for this
+      # component is based on, so the two sites test the same environment. An
+      # input because only this site can be pointed at a mirror.
+      image:
+        description: Container image for the batch job
+        type: string
+        required: false
+        default: quay.io/pypa/manylinux_2_28_x86_64
+      flags:
+        description: Extra cmake flags, whitespace separated. Empty is a default build
+        type: string
+        required: false
+        default: ""
+    outputs:
+      sha:
+        description: The commit that was checked out
+        value: ${{ jobs.build-and-test.outputs.sha }}
+      rocm_version:
+        # `rocm` is a specifier, not a version: a wildcard has no version in it
+        # at all and even an exact one can unpack a tarball with a different
+        # patch level. This is what the installation on the compute node
+        # reported, carried back in the artifacts. Empty when the run failed
+        # before ROCm was installed.
+        description: The ROCm version the installation reported
+        value: ${{ jobs.build-and-test.outputs.rocm_version }}
+      arch:
+        # The ROCm architecture, not the SLURM variant that was asked for: this
+        # is what the device code was compiled for, which is what a report
+        # comparing two runs wants to name.
+        description: The GPU architecture the run compiled and tested for
+        value: ${{ jobs.build-and-test.outputs.arch }}
+      node:
+        description: The compute node the batch job landed on
+        value: ${{ jobs.build-and-test.outputs.node }}
+
+permissions: {}
+
+jobs:
+  build-and-test:
+    name: build and test (rocm ${{ inputs.rocm }}, ${{ inputs.arch }})
+    # Only the alola pool carries this label, and those runners do nothing but
+    # hand work to SLURM over the ssh bridge: no GPU here, and no ROCm.
+    runs-on: [self-hosted, linux, x64, alola]
+    # This bounds the queue: a card can be busy for a long time and the job has
+    # not started yet. The `time` input bounds the job once it has.
+    timeout-minutes: 300
+    # The only job that touches the code under test, and all it may do is read
+    # it.
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      rocm_version: ${{ steps.rocm.outputs.version }}
+      arch: ${{ steps.target.outputs.target }}
+      node: ${{ steps.gpu.outputs.node }}
+
+    steps:
+      # The comment grammar checks this while parsing, so this is here for the
+      # manual caller, whose free-text field cannot. See the same step in
+      # internal-test-hpe-run.yml for why this is not a security boundary.
+      - name: Validate the extra cmake flags
+        if: inputs.flags != ''
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          set -eu
+          case "${FLAGS}" in
+            *[!-A-Za-z0-9_=+.,:\;/\ ]*)
+              echo "::error::flags='${FLAGS}' carries a character outside -A-Za-z0-9_=+.,:;/ and space; a cmake list value is semicolon separated and needs no quoting"
+              exit 1 ;;
+          esac
+
+      # SLURM's variant name and the ROCm architecture are two different
+      # namespaces, and only the first is the cluster's business: `arch` is
+      # checked against gpu-variant-mappings.yaml on the login node, while what
+      # this derives does two jobs on the compute node -- it picks which TheRock
+      # distribution is downloaded, and build.sh forwards it to
+      # CMAKE_HIP_ARCHITECTURES and GPU_TARGETS as what the device code is
+      # compiled for.
+      #
+      # That second job is why this maps mi350x to a plain `gfx950` rather than
+      # to the `gfx950-dcgpu` artifact group it publishes under: a group is not
+      # an architecture, and a build would reject it. The group is derived
+      # inside ci/internal/librocm.sh instead, which carries a gfx950 alias
+      # for it.
+      #
+      # This is the one map between the two namespaces, so a card that runs here
+      # is added once. internal-test-alola.yml carries the same names as its
+      # comment grammar's allowlist, which only exists so that a typo is a parse
+      # error rather than a failure two minutes into a job; keep the two in
+      # step.
+      - name: Derive the ROCm architecture from the GPU variant
+        id: target
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -eu
+          case "${ARCH,,}" in
+            mi300x|mi300a|mi308x|mi325x) target=gfx942 ;;
+            mi350x|mi355x) target=gfx950 ;;
+            mi210|mi210x|mi250) target=gfx90a ;;
+            # A canonical GRES name carries the architecture in front of the
+            # model, which is the one spelling that needs no map at all.
+            gfx*-*) target=${ARCH%%-*} ; target=${target,,} ;;
+            gfx*) target=${ARCH,,} ;;
+            *)
+              echo "::error::arch='${ARCH}' has no known ROCm architecture; pass one of mi300x mi300a mi308x mi325x mi350x mi355x mi210 mi250, or a gfx name such as gfx942-mi300x, gfx1100p or gfx1151"
+              exit 1 ;;
+          esac
+
+          # The RDNA variants put the model in a single trailing letter instead
+          # of behind a dash: gfx1100p and gfx1100w are two cards of gfx1100 and
+          # gfx1101v is one of gfx1101. Four digits are asked for in front of the
+          # letter so that gfx90a, whose letter belongs to the architecture, is
+          # left as it is. librocm.sh reduces the same spelling for a caller that
+          # reaches it without coming through here.
+          if [[ ${target} =~ ^gfx[0-9]{4}[a-z]$ ]]; then
+            target=${target:0:-1}
+          fi
+
+          echo "target=${target}" >>"${GITHUB_OUTPUT}"
+
+      # On the bridge, so the tree travels in the staged workspace: a compute
+      # node is meant to need nothing but a container registry.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: hipcomp_core
+
+      - name: Record the commit under test
+        id: commit
+        run: echo "sha=$(git -C hipcomp_core rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
+      # The scripts that run are the ones at `ref`. Without them the job would
+      # stage a workspace, wait for a card and fail in the container with "no
+      # such file", twenty minutes after the comment; naming the missing script
+      # and the branch that carries it takes ten seconds.
+      - name: Check that this commit carries the container scripts
+        run: |
+          set -eu
+          for script in prepare-container.sh librocm.sh libos.sh prepare.sh build.sh test.sh; do
+            if [ ! -f "hipcomp_core/ci/internal/${script}" ]; then
+              echo "::error::this commit has no ci/internal/${script}; a test run needs the container scripts, which are on amd-integration and its descendants"
+              exit 1
+            fi
+          done
+
+      - name: Check that this commit understands the extra cmake flags
+        if: inputs.flags != ''
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          set -eu
+          if ! grep -q HIPCOMP_CORE_CMAKE_ARGS hipcomp_core/ci/internal/build.sh; then
+            echo "::error::this commit carries a build.sh that ignores HIPCOMP_CORE_CMAKE_ARGS; flags='${FLAGS}' would have no effect until that change is on the branch"
+            exit 1
+          fi
+
+      - name: Build and test on a GPU node
+        id: gpu
+        uses: AMD-AIOSS/gha-runner-alola@main
+        with:
+          profile: default
+          image: ${{ inputs.image }}
+          arch: ${{ inputs.arch }}
+          gpus: "1"
+          cpus: "32"
+          mem: 128G
+          time: ${{ inputs.time }}
+          # Fetched even when the command fails, which is what makes the
+          # packages and the installed-version readback of a failed run
+          # available.
+          artifacts-dir: alola-artifacts
+          # One NAME=value per line. Every value here comes from an input the
+          # comment grammar allowlisted or a form field, and the login node
+          # validates the names against the set the harness owns before any of
+          # it reaches the job.
+          #
+          # This is the env: block of internal-test-hpe-run.yml, minus what only
+          # makes sense on a runner: the directories the container sees at fixed
+          # paths, which the command below exports, and ROCM_VERSION, which
+          # prepare-container.sh reads back out of the installation it makes.
+          env: |
+            ROCM_SPECIFIER=${{ inputs.rocm }}
+            ROCM_PATH=/opt/rocm
+            AMDGPU_TARGETS=${{ steps.target.outputs.target }}
+            MANYLINUX_DEFAULT_PYTHON_VERSION=3.12
+            HIPCOMP_CORE_BUILD_TYPE=build
+            HIPCOMP_CORE_CMAKE_ARGS=${{ inputs.flags }}
+            CMAKE_BUILD_PARALLEL_LEVEL=32
+          # The hpe job's steps, in order, as one script: the harness runs it
+          # from /workspace inside the container, under `set -euo pipefail`,
+          # as the image's root.
+          command: |
+            # Not passed through the action's env input: the harness owns these
+            # names and rejects them, because they are how device visibility and
+            # the loader are pointed somewhere else.
+            #
+            # /dev/kfd is passed whole rather than per allocation, so a node's
+            # other cards are visible here; the suite uses one, as it does on
+            # hpe.
+            export HIP_VISIBLE_DEVICES=0
+            # build.sh resolves the checkout as ${SRC_DIR}/${PROJECT_ID}, and
+            # the staged workspace put it at /workspace/hipcomp_core.
+            export SRC_DIR=/workspace
+            export PROJECT_ID=hipcomp_core
+            # Node-local, rather than the session directory, which is shared
+            # storage and is tarred back at the end. The build tree is tens of
+            # gigabytes and nothing in it is wanted afterwards -- but test.sh
+            # reads it, so it has to outlive build.sh, which it does: both run
+            # in this one script on this one node.
+            export BUILD_DIR=/tmp/build
+            export INSTALL_DIR=/tmp/install
+            # Only /artifacts comes back, so the packages are built into it.
+            export BUILD_ARTIFACTS_DIR=/artifacts/packages
+            # There are no later steps to inherit an environment, so
+            # prepare-container.sh writes it here and the script sources it.
+            export ROCM_ENV_FILE=/tmp/rocm-env.sh
+
+            # The session directory is written as root while the login account
+            # tars it back, and a failed run's artifacts are worth as much as a
+            # successful one's -- more, usually.
+            collect() {
+              chmod -R a+rX /artifacts 2>/dev/null || true
+            }
+            trap collect EXIT
+
+            # Installs the requested ROCm into the manylinux image and exports
+            # the ROCm and HIP environment the scripts below expect.
+            bash hipcomp_core/ci/internal/prepare-container.sh
+            . "${ROCM_ENV_FILE}"
+
+            # What the installation reported, as against the specifier that
+            # asked for it. Read back into a job output on the runner, because
+            # a batch job has no step outputs to write.
+            mkdir -p /artifacts
+            printf '%s\n' "${ROCM_VERSION}" >/artifacts/rocm-version.txt
+
+            # After the ROCm install, not before: this decides whether to
+            # install the hipcub and rocthrust packages by looking for their
+            # headers under ${ROCM_PATH}.
+            bash hipcomp_core/ci/internal/prepare.sh
+
+            # Cheap, and it turns a device-mapping mistake into an immediate
+            # answer rather than one that surfaces after twenty minutes of
+            # compiling.
+            rocm-smi
+
+            bash hipcomp_core/ci/internal/build.sh
+            bash hipcomp_core/ci/internal/test.sh
+
+      # A failure is when the node and the job id matter most, and without this
+      # the step is skipped exactly then.
+      - name: Where it ran
+        if: always()
+        env:
+          SESSION: ${{ steps.gpu.outputs.session }}
+          JOB_ID: ${{ steps.gpu.outputs.job-id }}
+          NODE: ${{ steps.gpu.outputs.node }}
+          IMAGE: ${{ inputs.image }}
+          ARCH: ${{ inputs.arch }}
+          TARGET: ${{ steps.target.outputs.target }}
+          TIME: ${{ inputs.time }}
+        run: |
+          {
+            echo "### the batch job"
+            echo
+            echo "- node: \`${NODE:-(never allocated)}\`, requested \`${ARCH}\` (\`${TARGET}\`)"
+            echo "- SLURM job: \`${JOB_ID:-(never submitted)}\`, session \`${SESSION:-(none opened)}\`, wall clock \`${TIME}\`"
+            echo "- image: \`${IMAGE}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      # The version the container read back out of rocm_version.h. It travelled
+      # in the artifacts because a batch job has no step outputs to write.
+      #
+      # Empty when the install never happened, which a caller has to tolerate.
+      - name: Report the installed ROCm version
+        id: rocm
+        if: always()
+        run: |
+          set -eu
+          version=$(cat alola-artifacts/rocm-version.txt 2>/dev/null || true)
+          echo "version=${version//[^0-9.]/}" >>"${GITHUB_OUTPUT}"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: packages-${{ steps.commit.outputs.sha }}-${{ steps.target.outputs.target }}
+          path: |
+            alola-artifacts/packages/*.rpm
+            alola-artifacts/packages/*.deb
+          if-no-files-found: ignore

@@ -1,0 +1,171 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The Actions-tab way into a test on hpe. The run is the same one a `/test hpe`
+# comment produces -- both callers hand the same values to
+# internal-test-hpe-run.yml -- so this file is only the parameter form and the
+# commit status.
+#
+# When to reach for this rather than the comment: to test a branch that has no
+# pull request, to re-run a configuration against an older release branch, or
+# to test a pull request head while keeping the noise out of its conversation.
+#
+# The `ref` input is what gets built, and it is not the same thing as the
+# branch chosen in the UI's "Use workflow from" selector. That selector decides
+# only which copy of these workflow files runs, and GitHub offers it here at
+# all only because this workflow lives on the default branch. Leaving the
+# selector on the default branch while pointing `ref` at a release branch is
+# the normal case: the newest reporting with any code under test.
+#
+# No author gate, unlike the comment path: dispatching a workflow already
+# requires write access, so the authorization the comment path has to check for
+# itself is GitHub's own here.
+
+name: test (hpe, manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: What to build and test. A branch, tag, sha, or refs/pull/<n>/head
+        type: string
+        required: true
+        default: amd-integration
+      # No architecture: this site is one MI210 machine, so a dropdown with one
+      # option was a question with one answer. internal-test-alola-manual.yml is
+      # where an architecture is a choice.
+      rocm:
+        # The `?` spellings mean the same as the `*` ones; they exist because a
+        # `/test` comment renders `*a*` as emphasis. Named here too so the two
+        # entry points describe the same grammar.
+        description: "ROCm to install: therock:X.Y.Z, X.Y.Z, therock:* (or ?), therock:*rc* (or ?rc?), therock:*a* (or ?a?) or preinstalled"
+        type: string
+        default: therock:7.14.0
+      # The comment path writes these after a ` -- ` sentinel, because its
+      # options are whitespace-separated words. A form field has no such
+      # problem, so here it is simply the field.
+      flags:
+        description: "Extra cmake flags, whitespace separated, e.g. -D HIPCOMP_ZSTD_KERNEL_VERSION=clean. Empty is a default build"
+        type: string
+        default: ""
+
+# Per ref: a second run against the same ref supersedes the first rather than
+# queueing behind it on the single runner. A run against a different ref is a
+# different thing and waits its turn.
+#
+# The comment path dropped its group so that testing several configurations in
+# a row does not cancel anything, and the same argument applies to two forms
+# submitted from the Actions tab. Left as it is here for now, because a
+# dispatch is a deliberate single action where re-submitting usually does mean
+# "not that, this"; drop it if that turns out to be wrong.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build-and-test:
+    if: github.repository_owner == 'AMD-AIOSS'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/internal-test-hpe-run.yml
+    with:
+      ref: ${{ inputs.ref }}
+      rocm: ${{ inputs.rocm }}
+      flags: ${{ inputs.flags }}
+
+  report:
+    name: report
+    if: always() && github.repository_owner == 'AMD-AIOSS'
+    needs: build-and-test
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      contents: read # resolve the ref when the build did not get that far
+
+    steps:
+      # The same status context the comment path writes, on purpose: a manual
+      # run against a pull request head then updates the very check a reviewer
+      # is already looking at. That is only true while the two agree on how the
+      # context is spelled, so the format below mirrors the one the dispatch
+      # job of internal-test-hpe.yml builds -- a workflow cannot read another
+      # workflow's step outputs, which is why it is written twice.
+      #
+      # There is no comment to leave -- a dispatch has no pull request in
+      # context -- so the status and the step summary are the whole report.
+      - uses: actions/github-script@v9
+        env:
+          RESULT: ${{ needs.build-and-test.result }}
+          SHA: ${{ needs.build-and-test.outputs.sha }}
+          INSTALLED: ${{ needs.build-and-test.outputs.rocm_version }}
+          REF: ${{ inputs.ref }}
+          ROCM: ${{ inputs.rocm }}
+          FLAGS: ${{ inputs.flags }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { RESULT, REF, ROCM, INSTALLED } = process.env;
+            // Through the same whitespace normalisation the comment path's
+            // parse step does, so that a form and a comment asking for the
+            // same flags write one check rather than two that differ by a
+            // space.
+            const flags = process.env.FLAGS.trim().split(/\s+/).filter(Boolean).join(' ');
+            const state = { success: 'success', cancelled: 'error' }[RESULT] ?? 'failure';
+            // The faces the table in internal-test-report.yml uses, so a result
+            // reads the same wherever it is reported.
+            const face = {
+              success: '✅', failure: '❌', cancelled: '🚫', skipped: '⏭️',
+            }[RESULT] ?? '';
+            const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const status = `test hpe (${ROCM}, mi210`
+              + (flags ? `, flags ${flags}` : '') + ')';
+
+            // The run reports what it checked out, which is the commit a status
+            // has to name. It is empty only when the build failed before the
+            // checkout, and a validation failure is still worth a status, so
+            // resolve the ref here in that case.
+            const sha = process.env.SHA
+              || (await github.rest.repos.getCommit({ owner, repo, ref: REF })).data.sha;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              state,
+              context: status,
+              description: `build and test ${RESULT}`,
+              target_url: url,
+            });
+
+            // A dispatched run is not reproducible from anywhere else: the
+            // parameters exist only in the form that was submitted.
+            await core.summary
+              .addHeading('test (hpe, manual)', 3)
+              .addList([
+                `result: ${face ? `${face} ` : ''}${RESULT}`,
+                `ref: ${REF}`,
+                `commit: ${sha}`,
+                `gpu: mi210 (gfx90a)`,
+                `rocm: ${ROCM}${INSTALLED ? ` (installed ${INSTALLED})` : ''}`,
+                `cmake flags: ${flags || 'none'}`,
+              ])
+              .write();
