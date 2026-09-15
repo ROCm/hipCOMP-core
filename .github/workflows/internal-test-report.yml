@@ -31,8 +31,8 @@
 #
 # What is site-specific arrives as an input rather than being branched on here:
 # `marker` picks which comment is rewritten, `columns` and `key` the shape of
-# the table, so a site can add a field without touching this file and the rows
-# it has already collected stay where they are.
+# the table, so which fields a site renders and which of them make two runs the
+# same configuration are the caller's to choose.
 #
 # Each caller grants this `statuses`, `issues` and `pull-requests` write: a
 # called workflow cannot widen what it was given.
@@ -118,13 +118,22 @@ on:
         type: string
         required: false
         default: ""
-      # Part of every configuration's identity even at the site that has one
-      # card: it is what the device code was compiled for, not just what it ran
-      # on, so two architectures are two builds.
-      arch:
-        description: The GPU architecture the run compiled and tested for
+      # What identifies a configuration where several cards share the
+      # architecture below: a key carrying that would file two of them as one
+      # row. Empty at a site whose card is a constant of the workflow.
+      card:
+        description: The GPU variant the run asked for. Empty at a site with one card
         type: string
-        required: true
+        required: false
+        default: ""
+      # What the device code was compiled for: a result where `card` is set,
+      # identity where it is not. Empty when the run stopped before deriving
+      # one, so a caller that keys on it passes a constant instead.
+      arch:
+        description: The GPU architecture the run compiled and tested for. Empty when the run derived none
+        type: string
+        required: false
+        default: ""
       flags:
         description: Extra cmake flags the run configured with. Empty for a default build
         type: string
@@ -177,6 +186,7 @@ jobs:
           STATUS: ${{ inputs.status }}
           ROCM: ${{ inputs.rocm }}
           INSTALLED: ${{ inputs.installed }}
+          CARD: ${{ inputs.card }}
           ARCH: ${{ inputs.arch }}
           FLAGS: ${{ inputs.flags }}
           ACTIVITY: ${{ inputs.activity }}
@@ -185,7 +195,7 @@ jobs:
             const { owner, repo } = context.repo;
             const {
               MARKER, HEADING, NOTE, RESULT, SHA, REF, STATUS, ROCM,
-              INSTALLED, ARCH, FLAGS, ACTIVITY,
+              INSTALLED, CARD, ARCH, FLAGS, ACTIVITY,
             } = process.env;
             const columns = JSON.parse(process.env.COLUMNS);
             const keyFields = JSON.parse(process.env.KEY);
@@ -232,8 +242,9 @@ jobs:
             const key = (r) => keyFields.map((f) => r[f] || '').join('|');
             const row = {
               result: RESULT, sha: SHA, ref: REF || '', rocm: ROCM,
-              installed: INSTALLED || '', arch: ARCH, flags: FLAGS || '',
-              run: String(context.runId), at: new Date().toISOString(),
+              installed: INSTALLED || '', card: CARD || '', arch: ARCH || '',
+              flags: FLAGS || '', run: String(context.runId),
+              at: new Date().toISOString(),
             };
 
             const rowsOf = (body) => {
@@ -284,8 +295,10 @@ jobs:
                   return `\`${r.rocm}\``;
                 case 'installed':
                   return r.installed ? `\`${r.installed}\`` : '—';
+                case 'card':
+                  return r.card ? `\`${r.card}\`` : '—';
                 case 'arch':
-                  return `\`${r.arch}\``;
+                  return r.arch ? `\`${r.arch}\`` : '—';
                 // The configure line the run added to the default one. Rendered
                 // as code in one cell rather than broken into a column per
                 // option, because the grammar does not know what is in it.

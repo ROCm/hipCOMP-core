@@ -248,15 +248,20 @@ jobs:
           # other case, so the ref becomes a column and the first field of what
           # makes two runs the same configuration.
           #
-          # `arch` is a column here where the hpe table leaves it out: this site
-          # has many cards, so it is the column that table is read for.
+          # The card and the architecture are both columns here where the hpe
+          # table has neither: this site has many cards, so what a row ran on is
+          # what the table is read for. The key carries the card, because
+          # internal-test-alola-run.yml maps mi300x, mi300a, mi308x and mi325x
+          # all onto gfx942: keyed on the architecture, four cards are one row.
+          # Two spellings of one card are two rows -- the cluster, not this
+          # workflow, is the authority on which GRES names are one card.
           if [[ ${IS_PR} == true ]]; then
-            columns='["result", "sha", "rocm", "installed", "arch", "flags", "run", "at"]'
-            key='["rocm", "arch", "flags"]'
+            columns='["result", "sha", "rocm", "installed", "card", "arch", "flags", "run", "at"]'
+            key='["rocm", "card", "flags"]'
             note='One row per configuration, carrying its latest run. A commit that is not the head is a configuration this pull request has not been through since.'
           else
-            columns='["result", "ref", "sha", "rocm", "installed", "arch", "flags", "run", "at"]'
-            key='["ref", "rocm", "arch", "flags"]'
+            columns='["result", "ref", "sha", "rocm", "installed", "card", "arch", "flags", "run", "at"]'
+            key='["ref", "rocm", "card", "flags"]'
             note='One row per ref and configuration, carrying its latest run. A commit that is not the tip of its ref is a configuration that branch has not been through since.'
           fi
 
@@ -390,9 +395,10 @@ jobs:
       status: ${{ needs.dispatch.outputs.status }}
       rocm: ${{ needs.dispatch.outputs.rocm }}
       installed: ${{ needs.build-and-test.outputs.rocm_version }}
-      # The ROCm architecture the run derived, not the SLURM variant that was
-      # asked for: what the device code was compiled for is what comparing two
-      # rows is about. Falls back to the variant when the run never started,
-      # because the report still has a row to file.
-      arch: ${{ needs.build-and-test.outputs.arch || needs.dispatch.outputs.arch }}
+      # What was asked for, which the row is filed under, then what the run
+      # compiled for. No fallback on the second: a run that stopped before
+      # deriving an architecture has none, and the card standing in for one
+      # would file it apart from the configuration it belongs to.
+      card: ${{ needs.dispatch.outputs.arch }}
+      arch: ${{ needs.build-and-test.outputs.arch }}
       flags: ${{ needs.dispatch.outputs.flags }}
