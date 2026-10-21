@@ -76,6 +76,10 @@ on:
         description: SLURM wall clock limit for the batch job, e.g. 2h, 90m, 02:00:00
         type: string
         default: 2h
+      image:
+        description: Container image for the batch job
+        type: string
+        default: quay.io/pypa/manylinux_2_28_x86_64
 
 # Per ref and card: this site has many cards, so two runs of one commit on two
 # of them are two different things and neither should cancel the other. The
@@ -100,6 +104,7 @@ jobs:
       arch: ${{ inputs.arch }}
       reps: ${{ inputs.reps }}
       time: ${{ inputs.time }}
+      image: ${{ inputs.image }}
 
   report:
     name: the commit status and the summary
@@ -131,11 +136,12 @@ jobs:
           ARCH: ${{ inputs.arch }}
           REPS: ${{ inputs.reps }}
           TIME: ${{ inputs.time }}
+          IMAGE: ${{ inputs.image }}
         with:
           script: |
             const fs = require('fs');
             const { owner, repo } = context.repo;
-            const { RESULT, REF, BASE, ROCM, ARCH, REPS, TIME, NODE } = process.env;
+            const { RESULT, REF, BASE, ROCM, ARCH, REPS, TIME, IMAGE, NODE } = process.env;
             const state = { success: 'success', cancelled: 'error' }[RESULT] ?? 'failure';
             const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             const status = `perf alola (${ROCM}, ${ARCH}, reps ${REPS})`;
@@ -174,6 +180,7 @@ jobs:
               `- rocm: \`${ROCM}\``,
               `- reps: ${REPS}`,
               `- wall clock: \`${TIME}\``,
+              `- image: \`${IMAGE}\``,
               `- [log](${url})`,
               '',
             ];

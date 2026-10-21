@@ -72,6 +72,16 @@ on:
         type: string
         required: false
         default: 2h
+      # The same image a /test alola run uses. librocm.sh installs a bare
+      # version such as 7.2.0 only into an enterprise Linux image, and the
+      # action's own default is Ubuntu with ROCm 6.4 already in it, which
+      # refuses that install. An input because the manual form can point a
+      # run at another image.
+      image:
+        description: Container image for the batch job
+        type: string
+        required: false
+        default: quay.io/pypa/manylinux_2_28_x86_64
     outputs:
       sha:
         description: The commit that was checked out
@@ -178,6 +188,7 @@ jobs:
         uses: AMD-AIOSS/gha-runner-alola@main
         with:
           profile: default
+          image: ${{ inputs.image }}
           arch: ${{ inputs.arch }}
           gpus: "1"
           cpus: "32"
