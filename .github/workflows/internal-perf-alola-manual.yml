@@ -1,0 +1,182 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The Actions-tab way into a /perf run on alola. The run is the same one a
+# `/perf` comment produces -- both callers hand the same values to
+# internal-perf-alola-run.yml -- so this file is only the parameter form, the
+# commit status and the step summary.
+#
+# When to reach for this rather than the comment: to measure a branch that has
+# no pull request, or to sweep one commit across several cards without filling
+# a conversation with commands.
+#
+# The `ref` input is what gets built, and it is not the branch chosen in the
+# UI's "Use workflow from" selector; that selector decides only which copy of
+# these workflow files runs.
+#
+# No author gate, unlike the comment path: dispatching a workflow already
+# requires write access, so the authorization the comment path has to check for
+# itself is GitHub's own here. There is no comment to leave either: a dispatch
+# has no pull request in context, so the status and the step summary are the
+# whole report.
+
+name: perf (alola, manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: What to build and measure. A branch, tag, sha, or refs/pull/<n>/head
+        type: string
+        required: true
+        default: amd-integration
+      base:
+        description: Second commit to measure against. Empty measures the head alone
+        type: string
+        required: false
+        default: ""
+      # The cards internal-perf-alola-run.yml maps to a ROCm architecture. A
+      # dropdown rather than the comment grammar's free text plus allowlist. A
+      # card outside this list can still be reached by its GRES name from a
+      # comment.
+      arch:
+        description: GPU variant to allocate
+        type: choice
+        options: [mi308x, mi300x, mi300a, mi325x, mi350x, mi355x, mi210, mi250]
+        default: mi308x
+      rocm:
+        description: "ROCm to install: X.Y.Z, therock:X.Y.Z, therock:* (or ?), therock:*rc* (or ?rc?), therock:*a* (or ?a?) or preinstalled"
+        type: string
+        default: "7.2.0"
+      reps:
+        description: Repetitions per workload
+        type: choice
+        options: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        default: "3"
+      time:
+        description: SLURM wall clock limit for the batch job, e.g. 2h, 90m, 02:00:00
+        type: string
+        default: 2h
+
+# Per ref and card: this site has many cards, so two runs of one commit on two
+# of them are two different things and neither should cancel the other. The
+# comment path has no group at all; see internal-test-hpe-manual.yml for why a
+# dispatch keeps one.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}-${{ inputs.arch }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  measure:
+    if: github.repository_owner == 'AMD-AIOSS'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/internal-perf-alola-run.yml
+    with:
+      ref: ${{ inputs.ref }}
+      base: ${{ inputs.base }}
+      rocm: ${{ inputs.rocm }}
+      arch: ${{ inputs.arch }}
+      reps: ${{ inputs.reps }}
+      time: ${{ inputs.time }}
+
+  report:
+    name: the commit status and the summary
+    if: always() && github.repository_owner == 'AMD-AIOSS'
+    needs: measure
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      contents: read # resolve the ref when the build did not get that far
+
+    steps:
+      - uses: actions/download-artifact@v7
+        if: needs.measure.outputs.sha != ''
+        continue-on-error: true
+        with:
+          name: perf-${{ needs.measure.outputs.sha }}
+          path: perf-artifact
+
+      - name: Report the result on the commit and in the summary
+        uses: actions/github-script@v9
+        env:
+          RESULT: ${{ needs.measure.result }}
+          SHA: ${{ needs.measure.outputs.sha }}
+          NODE: ${{ needs.measure.outputs.node }}
+          REF: ${{ inputs.ref }}
+          BASE: ${{ inputs.base }}
+          ROCM: ${{ inputs.rocm }}
+          ARCH: ${{ inputs.arch }}
+          REPS: ${{ inputs.reps }}
+          TIME: ${{ inputs.time }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const { RESULT, REF, BASE, ROCM, ARCH, REPS, TIME, NODE } = process.env;
+            const state = { success: 'success', cancelled: 'error' }[RESULT] ?? 'failure';
+            const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const status = `perf alola (${ROCM}, ${ARCH}, reps ${REPS})`;
+
+            // The run reports what it checked out, which is the commit a status
+            // has to name. It is empty only when the build failed before the
+            // checkout, and a validation failure is still worth a status, so
+            // resolve the ref here in that case.
+            const sha = process.env.SHA
+              || (await github.rest.repos.getCommit({ owner, repo, ref: REF })).data.sha;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              state,
+              context: status,
+              description: `measure ${RESULT}`,
+              target_url: url,
+            });
+
+            let md = '';
+            for (const path of ['perf-artifact/perf.md', 'perf-artifact/perf/perf.md']) {
+              if (fs.existsSync(path)) {
+                md = fs.readFileSync(path, 'utf8');
+                break;
+              }
+            }
+
+            const lines = [
+              '### perf (alola, manual)',
+              '',
+              `- result: ${RESULT}`,
+              `- ref: \`${REF}\``,
+              `- base: ${BASE ? `\`${BASE}\`` : 'none'}`,
+              `- commit: \`${sha}\``,
+              `- gpu: ${ARCH}${NODE ? ` on \`${NODE}\`` : ''}`,
+              `- rocm: \`${ROCM}\``,
+              `- reps: ${REPS}`,
+              `- wall clock: \`${TIME}\``,
+              `- [log](${url})`,
+              '',
+            ];
+            if (md) lines.push(md.endsWith('\n') ? md.slice(0, -1) : md);
+            else lines.push('The run produced no `perf.md`. The log has the reason.');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');

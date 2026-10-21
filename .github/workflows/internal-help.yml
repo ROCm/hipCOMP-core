@@ -1,0 +1,126 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# `/help` on a pull request or an issue: write back the syntax of the comment
+# commands this repository runs.
+#
+# The text below is the grammars of internal-test-hpe.yml, internal-test-alola.yml
+# and internal-perf-alola.yml, with their defaults. A change to one of those
+# parsers has to change this comment too, or `/help` describes a command the
+# parser no longer accepts. An issue_comment event runs the copy of this file
+# on the default branch, not the one in the pull request.
+
+name: help
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  reply:
+    name: reply
+    # Authorization comes from the event payload, so an unauthorized comment
+    # never reaches a runner. `/help` is its own prefix, so it does not take a
+    # `/test` or a `/perf`.
+    if: >-
+      github.repository_owner == 'AMD-AIOSS'
+      && startsWith(github.event.comment.body, '/help')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                  github.event.comment.author_association)
+    # Self-hosted because the organization's IP allow list rejects a hosted
+    # runner's egress address for the API. Unlabelled: this only talks to it.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+      # First line only, and `/help` with nothing after it. `/helpX` and
+      # `/help ref=main` are rejected here rather than answered with a syntax
+      # the writer did not ask for.
+      - name: Check the command
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euf
+          line=${BODY%%$'\n'*}
+          line=${line%$'\r'}
+          rest=${line#*/help}
+          case "${rest}" in
+            ''|[[:space:]]*) ;;
+            *)
+              echo "::error::'${line}' is not the /help command"
+              exit 1 ;;
+          esac
+          for tok in ${rest}; do
+            echo "::error::unknown /help option '${tok}'; /help takes no options"
+            exit 1
+          done
+
+      - name: Post the syntax
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            // Keep this in step with the parsers named in the file header.
+            const body = [
+              '### help',
+              '',
+              'Comment commands. Each reads its first line only, and a change to one takes effect when it merges to the default branch.',
+              '',
+              '**`/test`** and **`/test hpe`**, on the hpe machine:',
+              '',
+              '```',
+              '/test [hpe] [ref=<branch|tag>] [sha=<7-40 hex>] [rocm=<specifier>] [-- <cmake flags>]',
+              '```',
+              '',
+              'Default `rocm` is `therock:7.14.0`. `ref` and `sha` together are rejected. On a pull request, neither means the head.',
+              '',
+              '**`/test alola`**, on one Alola card:',
+              '',
+              '```',
+              '/test alola [ref=<branch|tag>] [sha=<7-40 hex>] [rocm=<specifier>] [arch=<card>] [time=<wall clock>] [-- <cmake flags>]',
+              '```',
+              '',
+              'Defaults: `rocm` `therock:7.14.0`, `arch` `mi300x`, `time` `2h`. `arch` is one of `mi300x`, `mi300a`, `mi308x`, `mi325x`, `mi350x`, `mi355x`, `mi210`, `mi210x`, `mi250`, or a GRES name such as `gfx942-mi300x`.',
+              '',
+              '**`/perf`**, a benchmark on one Alola card. The script it runs is `ci/internal/perf.sh` from the commit under test:',
+              '',
+              '```',
+              '/perf [base=<ref|sha>] [ref=<branch|tag>] [sha=<7-40 hex>] [rocm=<specifier>] [arch=<card>] [reps=<1-9>] [time=<wall clock>]',
+              '```',
+              '',
+              'Defaults: `rocm` `7.2.0`, `arch` `mi308x`, `reps` `3`, `time` `2h`. `base` builds a second commit and the two run interleaved. The same run can be started from the Actions tab as `perf (alola, manual)`; the "Use workflow from" selector there picks the workflow file, and the `ref` field picks what is measured.',
+              '',
+              '**`/help`** takes no options and writes this comment.',
+              '',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: context.issue.number, body,
+            });
+            await github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content: 'eyes',
+            });

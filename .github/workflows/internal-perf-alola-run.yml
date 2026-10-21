@@ -1,0 +1,238 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# The work of a /perf run on alola, with no trigger of its own: check out the
+# commit, build it on one card, and run ci/internal/perf.sh from that commit.
+#
+# Called, never dispatched. internal-perf-alola.yml (a `/perf` comment) and
+# internal-perf-alola-manual.yml (the Actions tab) are the two ways in, and
+# they hand this the same values, so a comment and a form measure the same way.
+#
+# This file does not know what is being timed. perf.sh is read from the commit
+# under test, the way internal-test-alola-run.yml reads build.sh and test.sh.
+#
+# This compiles and executes the code at `ref`, so it takes no secrets and asks
+# for nothing but a read-only token.
+
+name: perf (alola, run)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: What to build and measure. A branch, tag or sha
+        type: string
+        required: true
+      # Empty means the head on its own. A second checkout otherwise, which
+      # perf.sh builds and runs interleaved with the head.
+      base:
+        description: Second commit to measure against. Empty measures the head alone
+        type: string
+        required: false
+        default: ""
+      rocm:
+        description: ROCM_SPECIFIER for ci/internal/librocm.sh
+        type: string
+        required: true
+      # A SLURM GPU variant, not a ROCm architecture. The cluster checks it
+      # against its own gpu-variant-mappings.yaml, so an unknown card is
+      # refused there rather than guessed at here.
+      arch:
+        description: GPU variant to allocate, e.g. mi308x or gfx1151
+        type: string
+        required: true
+      reps:
+        description: Repetitions per workload, 1 to 9
+        type: string
+        required: false
+        default: "3"
+      # Bounds the batch job once it has started, where the job's own
+      # timeout-minutes bounds the wait for a card.
+      time:
+        description: SLURM wall clock limit for the batch job, e.g. 2h
+        type: string
+        required: false
+        default: 2h
+    outputs:
+      sha:
+        description: The commit that was checked out
+        value: ${{ jobs.measure.outputs.sha }}
+      node:
+        description: The compute node the batch job landed on
+        value: ${{ jobs.measure.outputs.node }}
+
+permissions: {}
+
+jobs:
+  measure:
+    name: measure (rocm ${{ inputs.rocm }}, ${{ inputs.arch }})
+    # Only the alola pool carries this label, and those runners do nothing but
+    # hand work to SLURM over the ssh bridge: no GPU here, and no ROCm.
+    runs-on: [self-hosted, linux, x64, alola]
+    # This bounds the queue: a card can be busy for a long time and the job has
+    # not started yet. The `time` input bounds the job once it has.
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      node: ${{ steps.gpu.outputs.node }}
+
+    steps:
+      # The comment grammar checks these while parsing, so this is here for the
+      # manual caller, whose free-text fields cannot.
+      - name: Validate reps and the wall clock
+        env:
+          REPS: ${{ inputs.reps }}
+          TIME: ${{ inputs.time }}
+        run: |
+          set -eu
+          case "${REPS}" in
+            [1-9]) ;;
+            *)
+              echo "::error::reps='${REPS}' is not a single digit from 1 to 9"
+              exit 1 ;;
+          esac
+          if [[ ! ${TIME} =~ ^([0-9]{1,2}h([0-9]{1,2}m)?|[0-9]{1,4}m|[0-9]{1,2}:[0-9]{2}:[0-9]{2})$ ]]; then
+            echo "::error::time='${TIME}' is not a SLURM wall clock; write 2h, 90m, 1h30m or 02:00:00"
+            exit 1
+          fi
+
+      # SLURM's variant name and the ROCm architecture are two different
+      # namespaces. This is the map internal-test-alola-run.yml uses; keep the
+      # two in step. What it derives is what perf.sh compiles for.
+      - name: Derive the ROCm architecture from the GPU variant
+        id: target
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -eu
+          case "${ARCH,,}" in
+            mi300x|mi300a|mi308x|mi325x) target=gfx942 ;;
+            mi350x|mi355x) target=gfx950 ;;
+            mi210|mi210x|mi250) target=gfx90a ;;
+            gfx*-*) target=${ARCH%%-*} ; target=${target,,} ;;
+            gfx*) target=${ARCH,,} ;;
+            *)
+              echo "::error::arch='${ARCH}' has no known ROCm architecture; pass one of mi300x mi300a mi308x mi325x mi350x mi355x mi210 mi250, or a gfx name such as gfx942-mi300x, gfx1100p or gfx1151"
+              exit 1 ;;
+          esac
+          if [[ ${target} =~ ^gfx[0-9]{4}[a-z]$ ]]; then
+            target=${target:0:-1}
+          fi
+          echo "target=${target}" >>"${GITHUB_OUTPUT}"
+
+      # On the bridge, so the tree travels in the staged workspace: a compute
+      # node is meant to need nothing but a container registry.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          path: hipcomp_core
+
+      - name: Record the commit under test
+        id: commit
+        run: echo "sha=$(git -C hipcomp_core rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v7
+        if: inputs.base != ''
+        with:
+          ref: ${{ inputs.base }}
+          path: hipcomp_core_base
+
+      # The script that runs is the one at the commit under test. Without it
+      # the job would stage a workspace, wait for a card and fail in the
+      # container with "no such file"; naming the missing script takes ten
+      # seconds. The base checkout is only a source tree, so it does not need
+      # one of its own.
+      - name: Check that this commit carries perf.sh
+        run: |
+          set -eu
+          for script in perf.sh prepare-container.sh prepare.sh; do
+            if [ ! -f "hipcomp_core/ci/internal/${script}" ]; then
+              echo "::error::this commit has no ci/internal/${script}; a /perf run needs it, and perf.sh arrives with the commit that adds the measurement"
+              exit 1
+            fi
+          done
+
+      - name: Measure on a GPU node
+        id: gpu
+        uses: AMD-AIOSS/gha-runner-alola@main
+        with:
+          profile: default
+          arch: ${{ inputs.arch }}
+          gpus: "1"
+          cpus: "32"
+          mem: 128G
+          time: ${{ inputs.time }}
+          # Fetched even when the command fails, which is what makes a
+          # discarded run's perf.md available to the caller.
+          artifacts-dir: alola-artifacts
+          env: |
+            ROCM_SPECIFIER=${{ inputs.rocm }}
+            ROCM_PATH=/opt/rocm
+            AMDGPU_TARGETS=${{ steps.target.outputs.target }}
+            MANYLINUX_DEFAULT_PYTHON_VERSION=3.12
+            CMAKE_BUILD_PARALLEL_LEVEL=32
+            PERF_REPS=${{ inputs.reps }}
+          # The harness runs this from /workspace inside the container, under
+          # `set -euo pipefail`, as the image's root. The same image and the
+          # same prepare scripts as a /test alola run, so the two measure and
+          # test one environment.
+          command: |
+            # Not passed through the action's env input: the harness owns these
+            # names and rejects them.
+            #
+            # /dev/kfd is passed whole rather than per allocation, so a node's
+            # other cards are visible here. perf.sh refuses to run unless it
+            # can tell which single card this job was given.
+            export HIP_VISIBLE_DEVICES=0
+            export SRC_DIR=/workspace
+            export PROJECT_ID=hipcomp_core
+            export BUILD_DIR=/tmp/build
+            export PERF_OUT=/artifacts/perf
+            export ROCM_ENV_FILE=/tmp/rocm-env.sh
+            if [ -d /workspace/hipcomp_core_base ]; then
+              export PERF_BASE_DIR=/workspace/hipcomp_core_base
+            fi
+
+            # The session directory is written as root while the login account
+            # tars it back, and a discarded run's note is worth as much as a
+            # table.
+            collect() {
+              chmod -R a+rX /artifacts 2>/dev/null || true
+            }
+            trap collect EXIT
+
+            bash hipcomp_core/ci/internal/prepare-container.sh
+            . "${ROCM_ENV_FILE}"
+            bash hipcomp_core/ci/internal/prepare.sh
+            bash hipcomp_core/ci/internal/perf.sh
+
+      # Named by the commit that was checked out, which is what both callers
+      # download. Skipped when the checkout never happened, so a failed
+      # validation does not publish an empty artifact under a broken name.
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.commit.outputs.sha != ''
+        with:
+          name: perf-${{ steps.commit.outputs.sha }}
+          path: alola-artifacts/perf/
+          if-no-files-found: ignore

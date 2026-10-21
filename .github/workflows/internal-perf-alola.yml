@@ -20,9 +20,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# `/perf` on a pull request or an issue: parse the command, build the commit it
-# names on one Alola card, and post the table that commit's ci/internal/perf.sh
+# `/perf` on a pull request or an issue: parse the command, and hand the rest
+# to internal-perf-alola-run.yml, which builds the commit on one Alola card and
+# runs ci/internal/perf.sh from it. This file then posts the table that script
 # wrote.
+#
+# The Actions-tab way in is internal-perf-alola-manual.yml. It calls the same
+# run, so a comment and a form measure the same way; this file is the grammar
+# and the comment.
 #
 # This file does not know what is being timed. perf.sh is read from the commit
 # under test, the way internal-test-alola-run.yml reads build.sh and test.sh, so
@@ -122,7 +127,7 @@ jobs:
               # rather than pattern-matched so that `arch=mi300` is a parse
               # error here, in a job that costs nothing, rather than a
               # rejection from the login node two minutes into a run. Keep in
-              # step with the map in the run job below.
+              # step with the map in internal-perf-alola-run.yml.
               arch=mi300x|arch=mi300a|arch=mi308x|arch=mi325x)
                 arch=${tok#arch=} ;;
               arch=mi350x|arch=mi355x)
@@ -268,137 +273,22 @@ jobs:
             echo "- wall clock: \`${TIME}\`"
           } >>"${GITHUB_STEP_SUMMARY}"
 
-  # The parsed comment, handed to one batch job. `sha` rather than the pull
+  # The parsed comment, handed to the shared run. `sha` rather than the pull
   # request's branch, so a push between the comment and the build cannot change
   # what is measured, and no secrets are passed: the job that compiles this
   # code gets the read-only token below and nothing else.
   run:
-    name: measure (rocm ${{ needs.dispatch.outputs.rocm }}, ${{ needs.dispatch.outputs.arch }})
     needs: dispatch
-    # Only the alola pool carries this label, and those runners do nothing but
-    # hand work to SLURM over the ssh bridge: no GPU here, and no ROCm.
-    runs-on: [self-hosted, linux, x64, alola]
-    # This bounds the queue: a card can be busy for a long time and the job has
-    # not started yet. The `time` output bounds the job once it has.
-    timeout-minutes: 300
     permissions:
       contents: read
-    outputs:
-      node: ${{ steps.gpu.outputs.node }}
-
-    steps:
-      # SLURM's variant name and the ROCm architecture are two different
-      # namespaces. This is the map internal-test-alola-run.yml uses; keep the
-      # two in step. What it derives is what perf.sh compiles for.
-      - name: Derive the ROCm architecture from the GPU variant
-        id: target
-        env:
-          ARCH: ${{ needs.dispatch.outputs.arch }}
-        run: |
-          set -eu
-          case "${ARCH,,}" in
-            mi300x|mi300a|mi308x|mi325x) target=gfx942 ;;
-            mi350x|mi355x) target=gfx950 ;;
-            mi210|mi210x|mi250) target=gfx90a ;;
-            gfx*-*) target=${ARCH%%-*} ; target=${target,,} ;;
-            gfx*) target=${ARCH,,} ;;
-            *)
-              echo "::error::arch='${ARCH}' has no known ROCm architecture; pass one of mi300x mi300a mi308x mi325x mi350x mi355x mi210 mi250, or a gfx name such as gfx942-mi300x, gfx1100p or gfx1151"
-              exit 1 ;;
-          esac
-          if [[ ${target} =~ ^gfx[0-9]{4}[a-z]$ ]]; then
-            target=${target:0:-1}
-          fi
-          echo "target=${target}" >>"${GITHUB_OUTPUT}"
-
-      # On the bridge, so the tree travels in the staged workspace: a compute
-      # node is meant to need nothing but a container registry.
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.dispatch.outputs.sha }}
-          path: hipcomp_core
-
-      - uses: actions/checkout@v7
-        if: needs.dispatch.outputs.base_sha != ''
-        with:
-          ref: ${{ needs.dispatch.outputs.base_sha }}
-          path: hipcomp_core_base
-
-      # The script that runs is the one at the commit under test. Without it
-      # the job would stage a workspace, wait for a card and fail in the
-      # container with "no such file"; naming the missing script takes ten
-      # seconds. The base checkout is only a source tree, so it does not need
-      # one of its own.
-      - name: Check that this commit carries perf.sh
-        run: |
-          set -eu
-          for script in perf.sh prepare-container.sh prepare.sh; do
-            if [ ! -f "hipcomp_core/ci/internal/${script}" ]; then
-              echo "::error::this commit has no ci/internal/${script}; a /perf run needs it, and perf.sh arrives with the commit that adds the measurement"
-              exit 1
-            fi
-          done
-
-      - name: Measure on a GPU node
-        id: gpu
-        uses: AMD-AIOSS/gha-runner-alola@main
-        with:
-          profile: default
-          arch: ${{ needs.dispatch.outputs.arch }}
-          gpus: "1"
-          cpus: "32"
-          mem: 128G
-          time: ${{ needs.dispatch.outputs.time }}
-          # Fetched even when the command fails, which is what makes a
-          # discarded run's perf.md available to the comment.
-          artifacts-dir: alola-artifacts
-          env: |
-            ROCM_SPECIFIER=${{ needs.dispatch.outputs.rocm }}
-            ROCM_PATH=/opt/rocm
-            AMDGPU_TARGETS=${{ steps.target.outputs.target }}
-            MANYLINUX_DEFAULT_PYTHON_VERSION=3.12
-            CMAKE_BUILD_PARALLEL_LEVEL=32
-            PERF_REPS=${{ needs.dispatch.outputs.reps }}
-          # The harness runs this from /workspace inside the container, under
-          # `set -euo pipefail`, as the image's root. The same image and the
-          # same prepare scripts as a /test alola run, so the two measure and
-          # test one environment.
-          command: |
-            # Not passed through the action's env input: the harness owns these
-            # names and rejects them.
-            #
-            # /dev/kfd is passed whole rather than per allocation, so a node's
-            # other cards are visible here. perf.sh refuses to run unless it
-            # can tell which single card this job was given.
-            export HIP_VISIBLE_DEVICES=0
-            export SRC_DIR=/workspace
-            export PROJECT_ID=hipcomp_core
-            export BUILD_DIR=/tmp/build
-            export PERF_OUT=/artifacts/perf
-            export ROCM_ENV_FILE=/tmp/rocm-env.sh
-            if [ -d /workspace/hipcomp_core_base ]; then
-              export PERF_BASE_DIR=/workspace/hipcomp_core_base
-            fi
-
-            # The session directory is written as root while the login account
-            # tars it back, and a discarded run's note is worth as much as a
-            # table.
-            collect() {
-              chmod -R a+rX /artifacts 2>/dev/null || true
-            }
-            trap collect EXIT
-
-            bash hipcomp_core/ci/internal/prepare-container.sh
-            . "${ROCM_ENV_FILE}"
-            bash hipcomp_core/ci/internal/prepare.sh
-            bash hipcomp_core/ci/internal/perf.sh
-
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: perf-${{ needs.dispatch.outputs.sha }}
-          path: alola-artifacts/perf/
-          if-no-files-found: ignore
+    uses: ./.github/workflows/internal-perf-alola-run.yml
+    with:
+      ref: ${{ needs.dispatch.outputs.sha }}
+      base: ${{ needs.dispatch.outputs.base_sha }}
+      rocm: ${{ needs.dispatch.outputs.rocm }}
+      arch: ${{ needs.dispatch.outputs.arch }}
+      reps: ${{ needs.dispatch.outputs.reps }}
+      time: ${{ needs.dispatch.outputs.time }}
 
   # One comment per run, not one rewritten in place: a measurement is a result
   # about the commits it names, and the next run does not make it stale.
@@ -418,7 +308,7 @@ jobs:
       - uses: actions/download-artifact@v7
         continue-on-error: true
         with:
-          name: perf-${{ needs.dispatch.outputs.sha }}
+          name: perf-${{ needs.run.outputs.sha }}
           path: perf-artifact
 
       - name: Post the table
