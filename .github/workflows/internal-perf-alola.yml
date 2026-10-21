@@ -1,0 +1,479 @@
+# MIT License
+#
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# `/perf` on a pull request or an issue: parse the command, build the commit it
+# names on one Alola card, and post the table that commit's ci/internal/perf.sh
+# wrote.
+#
+# This file does not know what is being timed. perf.sh is read from the commit
+# under test, the way internal-test-alola-run.yml reads build.sh and test.sh, so
+# a pull request measures its own benchmark and a change to the grammar takes
+# effect only once it is on the default branch. An issue_comment event runs the
+# copy of this file there, not the one in the pull request.
+
+name: perf (alola)
+
+on:
+  issue_comment:
+    types: [created]
+
+# No concurrency group, for the reason internal-test-alola.yml gives: one
+# command cancelling the run before it drops a result nobody can recover.
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: dispatch
+    # Authorization comes from the event payload, so an unauthorized comment
+    # never reaches a runner. Every comment in the repository starts a run of
+    # this workflow, and all but these end here, having allocated nothing.
+    if: >-
+      github.repository_owner == 'AMD-AIOSS'
+      && startsWith(github.event.comment.body, '/perf')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                  github.event.comment.author_association)
+    # Self-hosted because the organization's IP allow list rejects a hosted
+    # runner's egress address for the API, but unlabelled: this job only talks
+    # to the API, and in particular it is not the alola bridge.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      contents: read # expand a short sha
+      pull-requests: write # react to the triggering comment, resolve the head sha
+      issues: write # the same reaction, on a comment to a plain issue
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      rocm: ${{ steps.parse.outputs.rocm }}
+      arch: ${{ steps.parse.outputs.arch }}
+      reps: ${{ steps.parse.outputs.reps }}
+      time: ${{ steps.parse.outputs.time }}
+
+    steps:
+      # /perf [base=<ref|sha>] [ref=<branch|tag>] [sha=<7-40 hex>]
+      #       [rocm=<specifier>] [arch=<card>] [reps=<1-9>] [time=<2h>]
+      - name: Parse the command
+        id: parse
+        env:
+          # Through the environment, never interpolated into the script body: a
+          # comment is untrusted text and ${{ }} inside `run` is an injection.
+          BODY: ${{ github.event.comment.body }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+        run: |
+          # -f because the loop below splits the comment into words, and a body
+          # containing `*` would otherwise be expanded against the filesystem.
+          set -euf
+
+          # First line only, so a reply that quotes someone else's command
+          # cannot smuggle options past the allowlist below.
+          line=${BODY%%$'\n'*}
+          line=${line%$'\r'}
+
+          rocm=7.2.0
+          sha=
+          ref=
+          base=
+          # The card this site is usually asked for, and part of the
+          # configuration: it is what the device code gets compiled for. The
+          # same names internal-test-alola-run.yml maps to a ROCm architecture.
+          arch=mi308x
+          # One repetition is a single sample; three is what a noisy card needs
+          # before a median means anything, and it is what fits the default
+          # wall clock with a second build in the job.
+          reps=3
+          # What the batch job gets once it has a card, as against the job's own
+          # timeout-minutes, which bounds the wait for one.
+          time=2h
+
+          # The `if:` above matched `/perf` as a prefix, so `/perfX` arrives
+          # here. Saying what the command is beats reporting its first word as
+          # an unknown option.
+          rest=${line#*/perf}
+          case "${rest}" in
+            ''|[[:space:]]*) ;;
+            *)
+              echo "::error::'${line}' is not the /perf command"
+              exit 1 ;;
+          esac
+
+          for tok in ${rest}; do
+            case "${tok}" in
+              # The cards, as case globs because each is a fixed word. Listed
+              # rather than pattern-matched so that `arch=mi300` is a parse
+              # error here, in a job that costs nothing, rather than a
+              # rejection from the login node two minutes into a run. Keep in
+              # step with the map in the run job below.
+              arch=mi300x|arch=mi300a|arch=mi308x|arch=mi325x)
+                arch=${tok#arch=} ;;
+              arch=mi350x|arch=mi355x)
+                arch=${tok#arch=} ;;
+              arch=mi210|arch=mi210x|arch=mi250)
+                arch=${tok#arch=} ;;
+              *)
+                # Anchored regexes rather than case globs for the rest: two end
+                # up in a git ref and one drives an install.
+                #
+                # The rocm pattern is the ROCM_SPECIFIER grammar of
+                # ci/internal/librocm.sh, minus the two forms that need the
+                # Jenkins nodes. Repeated here because this job has no checkout
+                # to source the library from.
+                # The `?` spellings of the three wildcards are here because a
+                # comment is rendered markdown: `*a*` is emphasis, so the text
+                # a reader sees is not the specifier that ran. They are passed
+                # on as typed; librocm.sh rewrites them to the `*` forms.
+                if [[ ${tok} =~ ^rocm=(preinstalled|[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]{1,2})?|therock:(\*|\*(a|rc)\*|\?|\?(a|rc)\?|[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}((a|rc)[0-9]{1,8})?))$ ]]; then
+                  rocm=${tok#rocm=}
+                elif [[ ${tok} =~ ^sha=[0-9a-fA-F]{7,40}$ ]]; then
+                  sha=${tok#sha=}
+                elif [[ ${tok} =~ ^ref=[A-Za-z0-9._/-]{1,100}$ ]]; then
+                  ref=${tok#ref=}
+                elif [[ ${tok} =~ ^base=[A-Za-z0-9._/-]{1,100}$ ]]; then
+                  base=${tok#base=}
+                # A canonical GRES name, which the run job reduces to the
+                # architecture in front of the model. Shaped rather than listed,
+                # because the cluster is the authority on which of these exist.
+                elif [[ ${tok} =~ ^arch=gfx[0-9a-f]{3,4}[a-z]?(-[a-z0-9]{2,10})?$ ]]; then
+                  arch=${tok#arch=}
+                # SLURM's own spellings: 2h, 90m, 1h30m, 02:00:00.
+                elif [[ ${tok} =~ ^time=([0-9]{1,2}h([0-9]{1,2}m)?|[0-9]{1,4}m|[0-9]{1,2}:[0-9]{2}:[0-9]{2})$ ]]; then
+                  time=${tok#time=}
+                elif [[ ${tok} =~ ^reps=[1-9]$ ]]; then
+                  reps=${tok#reps=}
+                # A card that is neither in the list above nor shaped like a
+                # gfx name. Answered on its own, because "unknown option" for
+                # something that plainly is the arch option reads as a bug in
+                # the grammar rather than a typo in the card.
+                elif [[ ${tok} == arch=* ]]; then
+                  echo "::error::arch='${tok#arch=}' is not a card this runs on; the names are mi300x, mi300a, mi308x, mi325x, mi350x, mi355x, mi210, mi250, or a gfx name such as gfx942-mi300x, gfx1100p or gfx1151"
+                  exit 1
+                else
+                  # Failing beats silently running the default configuration,
+                  # which is what a typo would otherwise do.
+                  echo "::error::unknown /perf option '${tok}'; the options are base=, ref=, sha=, rocm=, arch=, reps= and time="
+                  exit 1
+                fi ;;
+            esac
+          done
+
+          # Both name what to measure, and the answers can differ. Rather than
+          # pick one, say so: `ref=` follows a branch, `sha=` pins a commit.
+          if [[ -n ${ref} && -n ${sha} ]]; then
+            echo "::error::ref=${ref} and sha=${sha} both say what to measure; keep the one you meant -- ref= follows a branch, sha= pins a commit"
+            exit 1
+          fi
+
+          # On a pull request, no ref means the head. On an issue there is no
+          # head to mean, and the command has to be told. base= is the other
+          # tree and does not stand in for one.
+          if [[ ${IS_PR} != true && -z ${ref} && -z ${sha} ]]; then
+            echo "::error::this comment is on an issue, not a pull request, so there is no head to measure; name what to measure with ref=<branch> (or sha=<commit>)"
+            exit 1
+          fi
+
+          # The allowlist above is also what keeps a crafted comment from
+          # injecting extra keys here: none of these can contain a newline.
+          # `requested` is whichever of ref= and sha= was given, so the next
+          # step has one string for one lookup.
+          {
+            echo "rocm=${rocm}"
+            echo "arch=${arch}"
+            echo "reps=${reps}"
+            echo "time=${time}"
+            echo "requested=${sha:-${ref}}"
+            echo "base=${base}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Resolve the commits and acknowledge the command
+        id: resolve
+        uses: actions/github-script@v9
+        env:
+          REQUESTED: ${{ steps.parse.outputs.requested }}
+          BASE_REF: ${{ steps.parse.outputs.base }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const requested = process.env.REQUESTED;
+            const baseRef = process.env.BASE_REF;
+            let sha;
+            if (requested) {
+              // One call for both spellings: getCommit resolves a branch, a
+              // tag or a short sha, and answers with the full forty characters.
+              // Resolved now, so a push between the comment and the build does
+              // not change what was measured.
+              sha = (await github.rest.repos.getCommit(
+                { owner, repo, ref: requested })).data.sha;
+            } else {
+              // No ref, so the pull request's head is what was meant. The
+              // parse step has already refused this on an issue, where
+              // context.issue.number is not a pull request to read.
+              sha = (await github.rest.pulls.get(
+                { owner, repo, pull_number: context.issue.number })).data.head.sha;
+            }
+            core.setOutput('sha', sha);
+
+            // Empty when the command named no second tree. Resolved the same
+            // way, so the comment quotes a commit and not a branch that has
+            // since moved.
+            let baseSha = '';
+            if (baseRef) {
+              baseSha = (await github.rest.repos.getCommit(
+                { owner, repo, ref: baseRef })).data.sha;
+            }
+            core.setOutput('base_sha', baseSha);
+
+            await github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content: 'eyes',
+            });
+
+      # A parameterized run is not reproducible from the comment thread unless
+      # the parameters are written down somewhere. The table itself is posted
+      # by the report job, once there is one.
+      - name: Record the resolved parameters
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+          BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
+          ROCM: ${{ steps.parse.outputs.rocm }}
+          ARCH: ${{ steps.parse.outputs.arch }}
+          REPS: ${{ steps.parse.outputs.reps }}
+          TIME: ${{ steps.parse.outputs.time }}
+        run: |
+          {
+            echo "### perf (alola)"
+            echo
+            echo "- commit: \`${SHA}\`"
+            echo "- base: ${BASE_SHA:+\`${BASE_SHA}\`}${BASE_SHA:-none}"
+            echo "- gpu: ${ARCH}"
+            echo "- rocm: \`${ROCM}\`"
+            echo "- reps: ${REPS}"
+            echo "- wall clock: \`${TIME}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+  # The parsed comment, handed to one batch job. `sha` rather than the pull
+  # request's branch, so a push between the comment and the build cannot change
+  # what is measured, and no secrets are passed: the job that compiles this
+  # code gets the read-only token below and nothing else.
+  run:
+    name: measure (rocm ${{ needs.dispatch.outputs.rocm }}, ${{ needs.dispatch.outputs.arch }})
+    needs: dispatch
+    # Only the alola pool carries this label, and those runners do nothing but
+    # hand work to SLURM over the ssh bridge: no GPU here, and no ROCm.
+    runs-on: [self-hosted, linux, x64, alola]
+    # This bounds the queue: a card can be busy for a long time and the job has
+    # not started yet. The `time` output bounds the job once it has.
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    outputs:
+      node: ${{ steps.gpu.outputs.node }}
+
+    steps:
+      # SLURM's variant name and the ROCm architecture are two different
+      # namespaces. This is the map internal-test-alola-run.yml uses; keep the
+      # two in step. What it derives is what perf.sh compiles for.
+      - name: Derive the ROCm architecture from the GPU variant
+        id: target
+        env:
+          ARCH: ${{ needs.dispatch.outputs.arch }}
+        run: |
+          set -eu
+          case "${ARCH,,}" in
+            mi300x|mi300a|mi308x|mi325x) target=gfx942 ;;
+            mi350x|mi355x) target=gfx950 ;;
+            mi210|mi210x|mi250) target=gfx90a ;;
+            gfx*-*) target=${ARCH%%-*} ; target=${target,,} ;;
+            gfx*) target=${ARCH,,} ;;
+            *)
+              echo "::error::arch='${ARCH}' has no known ROCm architecture; pass one of mi300x mi300a mi308x mi325x mi350x mi355x mi210 mi250, or a gfx name such as gfx942-mi300x, gfx1100p or gfx1151"
+              exit 1 ;;
+          esac
+          if [[ ${target} =~ ^gfx[0-9]{4}[a-z]$ ]]; then
+            target=${target:0:-1}
+          fi
+          echo "target=${target}" >>"${GITHUB_OUTPUT}"
+
+      # On the bridge, so the tree travels in the staged workspace: a compute
+      # node is meant to need nothing but a container registry.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.dispatch.outputs.sha }}
+          path: hipcomp_core
+
+      - uses: actions/checkout@v7
+        if: needs.dispatch.outputs.base_sha != ''
+        with:
+          ref: ${{ needs.dispatch.outputs.base_sha }}
+          path: hipcomp_core_base
+
+      # The script that runs is the one at the commit under test. Without it
+      # the job would stage a workspace, wait for a card and fail in the
+      # container with "no such file"; naming the missing script takes ten
+      # seconds. The base checkout is only a source tree, so it does not need
+      # one of its own.
+      - name: Check that this commit carries perf.sh
+        run: |
+          set -eu
+          for script in perf.sh prepare-container.sh prepare.sh; do
+            if [ ! -f "hipcomp_core/ci/internal/${script}" ]; then
+              echo "::error::this commit has no ci/internal/${script}; a /perf run needs it, and perf.sh arrives with the commit that adds the measurement"
+              exit 1
+            fi
+          done
+
+      - name: Measure on a GPU node
+        id: gpu
+        uses: AMD-AIOSS/gha-runner-alola@main
+        with:
+          profile: default
+          arch: ${{ needs.dispatch.outputs.arch }}
+          gpus: "1"
+          cpus: "32"
+          mem: 128G
+          time: ${{ needs.dispatch.outputs.time }}
+          # Fetched even when the command fails, which is what makes a
+          # discarded run's perf.md available to the comment.
+          artifacts-dir: alola-artifacts
+          env: |
+            ROCM_SPECIFIER=${{ needs.dispatch.outputs.rocm }}
+            ROCM_PATH=/opt/rocm
+            AMDGPU_TARGETS=${{ steps.target.outputs.target }}
+            MANYLINUX_DEFAULT_PYTHON_VERSION=3.12
+            CMAKE_BUILD_PARALLEL_LEVEL=32
+            PERF_REPS=${{ needs.dispatch.outputs.reps }}
+          # The harness runs this from /workspace inside the container, under
+          # `set -euo pipefail`, as the image's root. The same image and the
+          # same prepare scripts as a /test alola run, so the two measure and
+          # test one environment.
+          command: |
+            # Not passed through the action's env input: the harness owns these
+            # names and rejects them.
+            #
+            # /dev/kfd is passed whole rather than per allocation, so a node's
+            # other cards are visible here. perf.sh refuses to run unless it
+            # can tell which single card this job was given.
+            export HIP_VISIBLE_DEVICES=0
+            export SRC_DIR=/workspace
+            export PROJECT_ID=hipcomp_core
+            export BUILD_DIR=/tmp/build
+            export PERF_OUT=/artifacts/perf
+            export ROCM_ENV_FILE=/tmp/rocm-env.sh
+            if [ -d /workspace/hipcomp_core_base ]; then
+              export PERF_BASE_DIR=/workspace/hipcomp_core_base
+            fi
+
+            # The session directory is written as root while the login account
+            # tars it back, and a discarded run's note is worth as much as a
+            # table.
+            collect() {
+              chmod -R a+rX /artifacts 2>/dev/null || true
+            }
+            trap collect EXIT
+
+            bash hipcomp_core/ci/internal/prepare-container.sh
+            . "${ROCM_ENV_FILE}"
+            bash hipcomp_core/ci/internal/prepare.sh
+            bash hipcomp_core/ci/internal/perf.sh
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: perf-${{ needs.dispatch.outputs.sha }}
+          path: alola-artifacts/perf/
+          if-no-files-found: ignore
+
+  # One comment per run, not one rewritten in place: a measurement is a result
+  # about the commits it names, and the next run does not make it stale.
+  report:
+    name: post the table
+    if: always() && needs.dispatch.result == 'success'
+    needs: [dispatch, run]
+    # Self-hosted because the organization's IP allow list rejects a hosted
+    # runner's egress address for the API. Unlabelled: this only talks to it.
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: perf-${{ needs.dispatch.outputs.sha }}
+          path: perf-artifact
+
+      - name: Post the table
+        uses: actions/github-script@v9
+        env:
+          HEAD_SHA: ${{ needs.dispatch.outputs.sha }}
+          BASE_SHA: ${{ needs.dispatch.outputs.base_sha }}
+          ARCH: ${{ needs.dispatch.outputs.arch }}
+          ROCM: ${{ needs.dispatch.outputs.rocm }}
+          RESULT: ${{ needs.run.result }}
+          NODE: ${{ needs.run.outputs.node }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const { HEAD_SHA, BASE_SHA, ARCH, ROCM, RESULT, NODE } = process.env;
+            const server = `${context.serverUrl}/${owner}/${repo}`;
+            const url = `${server}/actions/runs/${context.runId}`;
+            const link = (sha) => sha
+              ? `[\`${sha.slice(0, 7)}\`](${server}/commit/${sha})`
+              : 'none';
+
+            // upload-artifact keeps the directory name or flattens it depending
+            // on the path; accept either layout, and a missing file, which is a
+            // run that died before perf.sh could write one.
+            let md = '';
+            for (const path of ['perf-artifact/perf.md', 'perf-artifact/perf/perf.md']) {
+              if (fs.existsSync(path)) {
+                md = fs.readFileSync(path, 'utf8');
+                break;
+              }
+            }
+
+            const lines = [
+              '### perf',
+              '',
+              `- commit: ${link(HEAD_SHA)}`,
+              `- base: ${link(BASE_SHA)}`,
+              `- gpu: \`${ARCH}\``,
+              `- rocm: \`${ROCM}\``,
+              `- result: ${RESULT}`,
+            ];
+            if (NODE) lines.push(`- node: \`${NODE}\``);
+            lines.push(`- [log](${url})`, '');
+            if (md) lines.push(md.endsWith('\n') ? md.slice(0, -1) : md);
+            else lines.push('The run produced no `perf.md`. The log has the reason.');
+
+            // GitHub rejects a comment body over 65536 characters. The headroom
+            // covers the gap between JavaScript's length and the bytes counted.
+            let body = lines.join('\n') + '\n';
+            if (body.length > 60000) {
+              body = body.slice(0, 60000) + '\n\n(truncated)\n';
+            }
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: context.issue.number, body,
+            });
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, body);
