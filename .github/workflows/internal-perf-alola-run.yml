@@ -53,9 +53,8 @@ on:
         description: ROCM_SPECIFIER for ci/internal/librocm.sh
         type: string
         required: true
-      # A SLURM GPU variant, not a ROCm architecture. The cluster checks it
-      # against its own gpu-variant-mappings.yaml, so an unknown card is
-      # refused there rather than guessed at here.
+      # A GPU variant name, not a ROCm architecture. An unknown card is
+      # refused by the scheduler rather than guessed at here.
       arch:
         description: GPU variant to allocate, e.g. mi308x or gfx1151
         type: string
@@ -95,8 +94,7 @@ permissions: {}
 jobs:
   measure:
     name: measure (rocm ${{ inputs.rocm }}, ${{ inputs.arch }})
-    # Only the alola pool carries this label, and those runners do nothing but
-    # hand work to SLURM over the ssh bridge: no GPU here, and no ROCm.
+    # Only the alola pool carries this label. The runner has no GPU and no ROCm.
     runs-on: [self-hosted, linux, x64, alola]
     # This bounds the queue: a card can be busy for a long time and the job has
     # not started yet. The `time` input bounds the job once it has.
@@ -151,8 +149,8 @@ jobs:
           fi
           echo "target=${target}" >>"${GITHUB_OUTPUT}"
 
-      # On the bridge, so the tree travels in the staged workspace: a compute
-      # node is meant to need nothing but a container registry.
+      # Checkout here, so the tree travels in the staged workspace. The machine
+      # with the card is meant to need nothing but a container registry.
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}

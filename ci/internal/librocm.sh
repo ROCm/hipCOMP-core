@@ -24,7 +24,7 @@
 
 # ROCm install and version helpers.
 #
-# Trimmed copy of aiss-3p-dev-pipelines' public/nodes/rocm/librocm.sh, reduced
+# Trimmed copy of the shared ROCm install helper, reduced
 # to what a CI build needs from a manylinux container. Everything retained is
 # byte-identical to upstream apart from the gfx950 alias noted in
 # amdgpu_target_to_therock_artifact_group, so a re-sync stays a readable diff,
@@ -36,8 +36,8 @@
 #     would displace the interpreter and toolchain of a manylinux image.
 #   - install_rocm rejects the 'therock:gh' and 'internal:...' specifiers.
 #     Building TheRock from source and reaching the internal artifact storage
-#     need credentials and tooling that only the aiss-3p-dev-pipelines nodes
-#     have; nothing else was dropped from the dispatcher.
+#     need credentials and tooling this script does not have; nothing else
+#     was dropped from the dispatcher.
 #
 # Upstream's install_rocm_ubuntu is absent because the workflows that source
 # this run on a manylinux image and no Debian one.
@@ -158,11 +158,11 @@ function __validate_rocm_version_expr() {
     return
   fi
 
-  # See the file header: these two need the aiss-3p-dev-pipelines nodes.
+  # See the file header: these two specifiers are not supported here.
   if [[ "${rocm_specifier}" == "therock:gh" ]] || \
      [[ "${rocm_specifier}" == "internal:"* ]]; then
     printf "ERROR: unsupported ROCM_SPECIFIER '${rocm_specifier}'\n" >&2
-    printf "ERROR: building TheRock from source and the internal ROCm builds are only available from the rocm_python* nodes in aiss-3p-dev-pipelines\n" >&2
+    printf "ERROR: building TheRock from source and the internal ROCm builds are not supported by this script\n" >&2
     return 1
   fi
 

@@ -95,10 +95,8 @@ permissions: {}
 jobs:
   build-and-test:
     name: build and test (rocm ${{ inputs.rocm }}, mi210)
-    # The architecture is not an input: this site is one machine, and asking for
-    # its only card was a way to mistype a runner label. gfx90a here rather than
-    # mi210 because that is what the machine is labelled with -- relabelling it
-    # is the one thing that changes this line.
+    # The architecture is not an input. The runner label is gfx90a; relabelling
+    # the runner is the one thing that changes this line.
     runs-on: [self-hosted, linux, gfx90a]
     # The build compiles device code for one architecture and the suite is some
     # twenty executables with no fast/slow split, several of which run to tens

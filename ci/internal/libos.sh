@@ -24,8 +24,7 @@
 
 # Container OS helpers.
 #
-# Trimmed copy of aiss-3p-dev-pipelines'
-# public/python/jdp/toolbox/linuxcontainers/nodes/libos.sh, reduced to the
+# Trimmed copy of the shared container OS helper, reduced to the
 # manylinux interpreter selection plus the probes CI reports. Upstream's
 # prepare_os/prepare_ubuntu_os/prepare_rhel_os are deliberately absent: they
 # install a package set (java, dkms, qemu-kvm, a second python, cmake3) that

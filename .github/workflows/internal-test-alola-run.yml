@@ -21,19 +21,15 @@
 # SOFTWARE.
 #
 # The work of a test on alola, with no trigger of its own: the same four
-# ci/internal scripts internal-test-hpe-run.yml runs, submitted to the cluster
-# as one SLURM batch job so that the run can ask for a card this organization
-# does not own a machine of.
+# ci/internal scripts internal-test-hpe-run.yml runs, submitted as one batch job.
 #
 # What differs from the hpe copy, and why this is a second file rather than an
 # input to the first:
 #
-#   - the runner is a login node with no GPU and no ROCm. It stages a workspace
-#     and hands a script to a compute node; everything that touches a card
-#     happens over there.
-#   - the compute node is meant to need nothing but a container registry, so
-#     the checkout happens here, on the bridge, and travels in the staged
-#     workspace.
+#   - the runner has no GPU and no ROCm. It stages a workspace and hands a
+#     script to the machine that has the card.
+#   - that machine is meant to need nothing but a container registry, so the
+#     checkout happens here and travels in the staged workspace.
 #   - there are no steps on the compute node, only one script. It gets no
 #     GITHUB_ENV to pass an environment along with, so where the hpe job has
 #     prepare-container.sh export into the steps that follow, this sources the
@@ -61,9 +57,8 @@ on:
         description: ROCM_SPECIFIER for ci/internal/librocm.sh
         type: string
         required: true
-      # A SLURM GPU variant, not a ROCm architecture. The cluster checks it
-      # against its own gpu-variant-mappings.yaml, so an unknown card is
-      # refused there rather than guessed at here.
+      # A GPU variant name, not a ROCm architecture. An unknown card is
+      # refused by the scheduler rather than guessed at here.
       arch:
         description: GPU variant to allocate, e.g. mi300x or gfx1151
         type: string
@@ -117,8 +112,7 @@ permissions: {}
 jobs:
   build-and-test:
     name: build and test (rocm ${{ inputs.rocm }}, ${{ inputs.arch }})
-    # Only the alola pool carries this label, and those runners do nothing but
-    # hand work to SLURM over the ssh bridge: no GPU here, and no ROCm.
+    # Only the alola pool carries this label. The runner has no GPU and no ROCm.
     runs-on: [self-hosted, linux, x64, alola]
     # This bounds the queue: a card can be busy for a long time and the job has
     # not started yet. The `time` input bounds the job once it has.
@@ -149,9 +143,8 @@ jobs:
               exit 1 ;;
           esac
 
-      # SLURM's variant name and the ROCm architecture are two different
-      # namespaces, and only the first is the cluster's business: `arch` is
-      # checked against gpu-variant-mappings.yaml on the login node, while what
+      # The requested GPU name and the ROCm architecture are two different
+      # namespaces. `arch` is checked against the scheduler's own mapping, while what
       # this derives does two jobs on the compute node -- it picks which TheRock
       # distribution is downloaded, and build.sh forwards it to
       # CMAKE_HIP_ARCHITECTURES and GPU_TARGETS as what the device code is
@@ -199,8 +192,8 @@ jobs:
 
           echo "target=${target}" >>"${GITHUB_OUTPUT}"
 
-      # On the bridge, so the tree travels in the staged workspace: a compute
-      # node is meant to need nothing but a container registry.
+      # Checkout here, so the tree travels in the staged workspace. The machine
+      # with the card is meant to need nothing but a container registry.
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
@@ -251,9 +244,9 @@ jobs:
           # available.
           artifacts-dir: alola-artifacts
           # One NAME=value per line. Every value here comes from an input the
-          # comment grammar allowlisted or a form field, and the login node
-          # validates the names against the set the harness owns before any of
-          # it reaches the job.
+          # comment grammar allowlisted or a form field, and the names are
+          # validated against the set the harness owns before any of it
+          # reaches the job.
           #
           # This is the env: block of internal-test-hpe-run.yml, minus what only
           # makes sense on a runner: the directories the container sees at fixed

@@ -48,8 +48,7 @@ jobs:
       && startsWith(github.event.comment.body, '/help')
       && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
                   github.event.comment.author_association)
-    # Self-hosted because the organization's IP allow list rejects a hosted
-    # runner's egress address for the API. Unlabelled: this only talks to it.
+    # Self-hosted and unlabelled: this job only talks to the API.
     runs-on: [self-hosted, linux]
     timeout-minutes: 5
     permissions:

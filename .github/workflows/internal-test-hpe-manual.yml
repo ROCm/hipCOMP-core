@@ -50,9 +50,8 @@ on:
         type: string
         required: true
         default: amd-integration
-      # No architecture: this site is one MI210 machine, so a dropdown with one
-      # option was a question with one answer. internal-test-alola-manual.yml is
-      # where an architecture is a choice.
+      # No architecture input: this workflow always uses the runner's card.
+      # internal-test-alola-manual.yml is where an architecture is a choice.
       rocm:
         # The `?` spellings mean the same as the `*` ones; they exist because a
         # `/test` comment renders `*a*` as emphasis. Named here too so the two

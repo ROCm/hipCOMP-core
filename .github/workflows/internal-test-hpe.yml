@@ -76,9 +76,7 @@ jobs:
       && !startsWith(github.event.comment.body, '/test alola')
       && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
                   github.event.comment.author_association)
-    # Self-hosted because the organization's IP allow list rejects a hosted
-    # runner's egress address for the API just as it does for a clone, but
-    # unlabelled: this job only talks to the API.
+    # Self-hosted and unlabelled: this job only talks to the API.
     runs-on: [self-hosted, linux]
     timeout-minutes: 5
     permissions:
@@ -248,11 +246,10 @@ jobs:
           # The specifier rather than the version that ends up installed --
           # nothing is installed yet at this point.
           #
-          # The site is in there because alola tests the same configurations on
-          # other cards, and a context it shared would have one site's run
-          # overwrite the other's check. `mi210` is what this site's one machine
-          # is, spelled the way a reader recognises rather than as the gfx90a
-          # runner label; it is constant here and the request on alola.
+          # The site is in the context because the alola workflow tests the same
+          # configurations on other cards, and a shared context would have one
+          # site's run overwrite the other's check. `mi210` names the card in
+          # the status; the runner label is gfx90a.
           status="test hpe (${rocm}, mi210"
           # An if rather than `[[ ... ]] &&`, which under `set -e` would exit
           # the step the moment the condition did not hold.
@@ -345,7 +342,7 @@ jobs:
               owner, repo, sha,
               state: 'pending',
               context: process.env.STATUS,
-              description: 'queued on the internal runner',
+              description: 'queued',
               target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
             });
 

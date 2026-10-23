@@ -27,8 +27,8 @@ set -xeu
 #
 # Turns a stock manylinux image into the environment the other ci/internal
 # scripts expect: a modern CPython as python3, ROCm installed under
-# ${ROCM_PATH}, and the ROCm/HIP environment exported. It is the counterpart of
-# the `manylinux` and `rocm` node init phases in aiss-3p-dev-pipelines, and it
+# ${ROCM_PATH}, and the ROCm/HIP environment exported. It follows the same
+# manylinux and ROCm setup as the other CI entry points, and it
 # uses the same two libraries (ci/internal/libos.sh, ci/internal/librocm.sh) so
 # a GitHub Actions run and a Jenkins run install ROCm the same way.
 #
@@ -50,7 +50,7 @@ set -xeu
 #                     accepted forms; 'therock:X.Y.Z' installs the TheRock
 #                     tarball, 'X.Y.Z' the repo.radeon.com packages,
 #                     'preinstalled' keeps whatever the image ships.
-#   AMDGPU_TARGETS    default gfx90a (the MI210 of the internal runner). A
+#   AMDGPU_TARGETS    default gfx90a. A
 #                     single target; picks the TheRock artifact group, and is
 #                     also what build.sh compiles for.
 #   ROCM_PATH         default /opt/rocm.
