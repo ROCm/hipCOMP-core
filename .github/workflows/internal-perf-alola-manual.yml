@@ -117,7 +117,7 @@ jobs:
       contents: read # resolve the ref when the build did not get that far
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         if: needs.measure.outputs.sha != ''
         continue-on-error: true
         with:

@@ -302,7 +302,7 @@ jobs:
       pull-requests: write
 
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: perf-${{ needs.run.outputs.sha }}
