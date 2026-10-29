@@ -24,10 +24,105 @@
 #   3. `rules.<rule-id>.disable: true` to disable a rule repository-wide.
 #
 # Add rule-specific settings and suppressions under `rules:`.
+#
+# Internal workflows are outside this gate. Zizmor can only ignore a file
+# per audit, so every audit lists the same names.
 
 rules:
+  adhoc-packages:
+    ignore: &internal-workflows
+      - internal-help.yml
+      - internal-perf-alola-manual.yml
+      - internal-perf-alola-run.yml
+      - internal-perf-alola.yml
+      - internal-test-alola-manual.yml
+      - internal-test-alola-run.yml
+      - internal-test-alola.yml
+      - internal-test-hpe-manual.yml
+      - internal-test-hpe-run.yml
+      - internal-test-hpe.yml
+      - internal-test-report.yml
+  anonymous-definition:
+    ignore: *internal-workflows
+  archived-uses:
+    ignore: *internal-workflows
+  artipacked:
+    ignore: *internal-workflows
+  bot-conditions:
+    ignore: *internal-workflows
+  cache-poisoning:
+    ignore: *internal-workflows
+  concurrency-limits:
+    ignore: *internal-workflows
+  dangerous-triggers:
+    ignore: *internal-workflows
+  dependabot-cooldown:
+    ignore: *internal-workflows
+  dependabot-execution:
+    ignore: *internal-workflows
+  excessive-permissions:
+    ignore: *internal-workflows
+  forbidden-uses:
+    ignore: *internal-workflows
+  github-app:
+    ignore: *internal-workflows
+  github-env:
+    ignore: *internal-workflows
+  hardcoded-container-credentials:
+    ignore: *internal-workflows
+  impostor-commit:
+    ignore: *internal-workflows
+  insecure-commands:
+    ignore: *internal-workflows
+  insecure-url-scheme:
+    ignore: *internal-workflows
+  known-vulnerable-actions:
+    ignore: *internal-workflows
+  misfeature:
+    ignore: *internal-workflows
+  obfuscation:
+    ignore: *internal-workflows
+  overprovisioned-secrets:
+    ignore: *internal-workflows
+  ref-confusion:
+    ignore: *internal-workflows
+  ref-version-mismatch:
+    ignore: *internal-workflows
+  secrets-inherit:
+    ignore: *internal-workflows
+  secrets-outside-env:
+    ignore: *internal-workflows
+  self-hosted-runner:
+    ignore: *internal-workflows
+  self-repository:
+    ignore: *internal-workflows
+  stale-action-refs:
+    ignore: *internal-workflows
+  superfluous-actions:
+    ignore: *internal-workflows
+  template-injection:
+    ignore: *internal-workflows
+  typosquat-uses:
+    ignore: *internal-workflows
+  undocumented-permissions:
+    ignore: *internal-workflows
+  unpinned-images:
+    ignore: *internal-workflows
+  unpinned-tools:
+    ignore: *internal-workflows
   unpinned-uses:
+    ignore: *internal-workflows
     config:
       policies:
         # Security owns this workflow and moves the v1 tag.
         ROCm/rocm-security-gh/.github/workflows/security-baseline.yml: ref-pin
+  unredacted-secrets:
+    ignore: *internal-workflows
+  unsound-condition:
+    ignore: *internal-workflows
+  unsound-contains:
+    ignore: *internal-workflows
+  unsound-ternary:
+    ignore: *internal-workflows
+  use-trusted-publishing:
+    ignore: *internal-workflows
